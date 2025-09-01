@@ -55,3 +55,30 @@ monte_carlo:
   cf_std: 0.05
   cf_min: 0.05
   cf_max: 0.60
+
+  wind:
+  scada_path: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\wind turbine scada dataset\\T1.xlsx"
+  forecasting_path: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\wind power forecasting\\Turbine_Data.xlsx"
+  prefer_source: "scada"        # "scada" | "forecasting" | "auto"
+  rated_kw: null                # optional override; if null inferred from data
+  use_theoretical_power: true   # if SCADA has theoretical energy (kWh), infer rated from it
+  cf_floor: 0.02                # clamp CF in simulations
+  cf_cap: 0.65
+
+  uncertainty:
+    sampler: "bootstrap"        # "bootstrap" | "student_t" | "normal"
+    by_bucket: "month_of_year"  # "month_of_year" | "season3" | "none"
+    scale: 1.0
+    calibrate_sigma:
+      target_monthly_sigma: 0.10   # adjust visible fan width for CF residuals (log-space)
+      hard_min: 0.5
+      hard_max: 2.0
+    student_t:
+      nu: 5.0
+
+  # Fallback if no usable history (or to mix with history)
+  fallback_cf:
+    mean: 0.35
+    std: 0.05
+    min: 0.05
+    max: 0.60
