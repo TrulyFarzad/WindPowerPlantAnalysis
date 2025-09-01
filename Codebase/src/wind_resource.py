@@ -1,145 +1,171 @@
 # -*- coding: utf-8 -*-
 """
-wind_resource.py — Monthly production modeling for a wind plant (MWh),
-using SCADA/forecasting datasets when available, with plant-level
-availability/losses/degradation and Monte Carlo uncertainty around a
-seasonal baseline.
+wind_resource.py — Monthly production modeling (MWh) from:
+  - SCADA (T1.csv) -> LOWESS empirical power curve + historical monthly CF
+  - Turbine_Data.csv -> extra wind speed for Weibull fit
+  - Weibull per month-of-year over wind speed; sampling CF per month
+  - Availability, losses, degradation applied
 
-Outputs (saved next to config.yaml):
-    1) wind_hist_cf.png
-    2) wind_sampler_fan_chart.png
-    3) wind_sampler_heatmap.png
+Outputs next to config.yaml:
+  - wind_power_curve.png
+  - wind_hist_cf.png
+  - wind_sampler_fan_chart.png
+  - wind_sampler_heatmap.png
 """
 
-from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Tuple
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
+from scipy import stats
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
 # ------------------------- Dataclasses -------------------------
 
 @dataclass
-class MCVolCalib:
-    target_monthly_sigma: Optional[float] = None
-    hard_min: float = 0.5
-    hard_max: float = 2.0
+class ScadaFilters:
+    ws_min: float = 0.0
+    ws_max: float = 35.0
+    p_min_kw: float = 0.0
+    p_max_kw: Optional[float] = None  # if None -> infer from data (99.9%)
 
 @dataclass
-class StudentT:
-    nu: float = 5.0
+class WeibullCfg:
+    fit_loc_zero: bool = True
+    min_points_per_month: int = 200
 
 @dataclass
-class WindUncertaintyCfg:
-    sampler: str = "bootstrap"          # "bootstrap" | "student_t" | "normal"
-    by_bucket: str = "month_of_year"    # "month_of_year" | "season3" | "none"
-    scale: float = 1.0
-    calibrate_sigma: Optional[MCVolCalib] = None
-    student_t: Optional[StudentT] = None
+class SimMonthCF:
+    reps: int = 5000
+    samples_per_month: int = 720  # ~hourly
 
 @dataclass
 class WindFallbackCF:
     mean: float = 0.35
     std: float = 0.05
-    min: float = 0.05
-    max: float = 0.60
+    min: float = 0.10
+    max: float = 0.55
 
 @dataclass
 class WindCfg:
     scada_path: Optional[str]
     forecasting_path: Optional[str]
-    prefer_source: str = "scada"
+    prefer_source: str = "auto"   # auto | scada | forecasting
     rated_kw: Optional[float] = None
     use_theoretical_power: bool = True
+    scada_filters: ScadaFilters = field(default_factory=ScadaFilters)
+    weibull: WeibullCfg = field(default_factory=WeibullCfg)
+    simulate_month_cf: SimMonthCF = field(default_factory=SimMonthCF)
     cf_floor: float = 0.02
     cf_cap: float = 0.65
-    uncertainty: WindUncertaintyCfg = field(default_factory=WindUncertaintyCfg)
     fallback_cf: WindFallbackCF = field(default_factory=WindFallbackCF)
 
+# ------------------------- YAML -------------------------
+
+def _load_yaml_config(path: str) -> Dict:
+    import yaml
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 # ------------------------- Helpers -------------------------
 
-def _month_key(ts: pd.Timestamp) -> Tuple[int, int]:
-    return ts.year, ts.month
+def _month_end(ts: pd.Timestamp) -> pd.Timestamp:
+    return pd.Timestamp(ts.year, ts.month, 1) + pd.offsets.MonthEnd(0)
 
 def _hours_in_month(ts: pd.Timestamp) -> float:
     start = pd.Timestamp(ts.year, ts.month, 1)
-    end = (start + pd.offsets.MonthEnd(1))
-    return (end - start + pd.Timedelta(days=1)).total_seconds() / 3600.0  # inclusive month end
+    end = start + pd.offsets.MonthEnd(1)
+    return (end - start).total_seconds() / 3600.0
 
-def _bucket_key(mo: int, mode: str) -> int:
-    if mode == "month_of_year":
-        return mo
-    if mode == "season3":
-        if mo in [12, 1, 2]:
-            return 0  # cold
-        if mo in [6, 7, 8]:
-            return 2  # hot
-        return 1      # shoulder
-    return -1
+def _coerce_numeric(series: pd.Series) -> pd.Series:
+    # handle decimal comma and stray chars
+    return pd.to_numeric(
+        series.astype(str)
+              .str.replace(",", ".", regex=False)
+              .str.replace(r"[^\d\.\-eE+]", "", regex=True),
+        errors="coerce"
+    )
 
-def _calibrate_scale(hist_sigma: float, cfg: WindUncertaintyCfg) -> float:
-    cal = cfg.calibrate_sigma
-    if not cal or cal.target_monthly_sigma is None or hist_sigma <= 0:
-        return float(cfg.scale)
-    s = float(cal.target_monthly_sigma) / float(hist_sigma)
-    s = max(float(cal.hard_min), min(float(cal.hard_max), s))
-    return s
+# ------------------------- Robust loaders -------------------------
 
-def _safe_percentile(a: np.ndarray, q: float) -> float:
-    if a.size == 0:
-        return np.nan
-    return float(np.nanpercentile(a, q))
-
-# ------------------------- Loaders -------------------------
-
-def _load_scada_excel(path: str) -> pd.DataFrame:
+def _load_scada(path: str) -> pd.DataFrame:
     """
-    Reads SCADA T1.xlsx. Expected columns (robust to variations):
-      - timestamp: 'Date/Time' or 'Date'/'Time'
-      - 'LV ActivePower (kW)' (or similar)
-      - 'Wind Speed (m/s)' (optional)
-      - 'Theoretical_Power_Curve (KWh)' (optional; per 10-min energy)
-    Returns a tidy frame: ['timestamp','P_kW','WS_ms','TheoP_kW'] at 10-min resolution.
+    Robust reader for T1.csv or Excel:
+      Expected columns (case-insensitive, flexible):
+        - Date/Time
+        - LV ActivePower (kW)
+        - Wind Speed (m/s)
+        - Theoretical_Power_Curve (KWh)  [optional]
+    Returns: ['timestamp','P_kW','WS_ms','TheoP_kW'] (some may be NaN).
     """
     if not path or not os.path.exists(path):
-        return pd.DataFrame(columns=["timestamp", "P_kW", "WS_ms", "TheoP_kW"])
-    df = pd.read_excel(path)
-    cols = {c.strip(): c for c in df.columns}
+        return pd.DataFrame(columns=["timestamp","P_kW","WS_ms","TheoP_kW"])
 
-    # Timestamp
-    ts = None
-    for key in ["Date/Time", "Timestamp", "DATE_TIME", "Date Time", "Date", "Datetime"]:
-        m = [c for c in cols if key.lower() in c.lower()]
-        if m:
-            ts = pd.to_datetime(df[cols[m[0]]], errors="coerce")
-            break
-    if ts is None and "Date" in cols and "Time" in cols:
-        ts = pd.to_datetime(
-            df[cols["Date"]].astype(str) + " " + df[cols["Time"]].astype(str),
-            errors="coerce"
-        )
-    if ts is None:
-        # fallback first column
-        ts = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".csv", ".txt"]:
+        df = pd.read_csv(path)
+    else:
+        # Excel (single or multi-sheet)
+        try:
+            xls = pd.ExcelFile(path)
+            # pick sheet with most of the expected columns
+            best, best_score = None, -1
+            for sh in xls.sheet_names:
+                tdf = pd.read_excel(xls, sheet_name=sh)
+                names = [str(c).strip().lower() for c in tdf.columns]
+                score = sum("power" in n for n in names) + sum("wind" in n and "speed" in n for n in names)
+                if score > best_score:
+                    best, best_score = tdf, score
+            df = best if best is not None else pd.read_excel(path)
+        except Exception:
+            df = pd.read_excel(path)
 
-    # Active Power (kW)
-    pcols = [c for c in cols if "active" in c.lower() and "power" in c.lower()]
-    P_kW = pd.to_numeric(df[cols[pcols[0]]], errors="coerce") if pcols else np.nan
+    # map columns
+    cols = {str(c).strip(): c for c in df.columns}
 
-    # Wind Speed (m/s)
-    wcols = [c for c in cols if "wind" in c.lower() and "speed" in c.lower()]
-    WS_ms = pd.to_numeric(df[cols[wcols[0]]], errors="coerce") if wcols else np.nan
+    # timestamp
+    ts_col = None
+    for key in ["Date/Time","Timestamp","Datetime","Date Time","Date"]:
+        for c in cols:
+            if key.lower() in c.lower():
+                ts_col = cols[c]; break
+        if ts_col is not None: break
+    ts = pd.to_datetime(df[ts_col], errors="coerce") if ts_col is not None else pd.to_datetime(df.iloc[:,0], errors="coerce")
 
-    # Theoretical curve (KWh per 10-min) -> convert to kW by ×6
-    tcols = [c for c in cols if "theoretical" in c.lower() or "curve" in c.lower()]
+    # Active power (kW)
+    p_col = None
+    for key in ["LV ActivePower (kW)","ActivePower","Active Power","(kW)"]:
+        for c in cols:
+            if key.lower() in c.lower():
+                p_col = cols[c]; break
+        if p_col is not None: break
+    P_kW = _coerce_numeric(df[p_col]) if p_col is not None else pd.Series(np.nan, index=df.index)
+
+    # Wind speed (m/s)
+    ws_col = None
+    for key in ["Wind Speed (m/s)","WindSpeed","Wind Speed","WS","m/s"]:
+        for c in cols:
+            if key.lower() in c.lower():
+                ws_col = cols[c]; break
+        if ws_col is not None: break
+    WS_ms = _coerce_numeric(df[ws_col]) if ws_col is not None else pd.Series(np.nan, index=df.index)
+
+    # Theoretical power (KWh per 10-min) -> kW
+    theo_col = None
+    for key in ["Theoretical_Power_Curve", "Theoretical", "Curve"]:
+        for c in cols:
+            if key.lower() in c.lower():
+                theo_col = cols[c]; break
+        if theo_col is not None: break
     TheoP_kW = None
-    if tcols:
-        th = pd.to_numeric(df[cols[tcols[0]]], errors="coerce")
-        TheoP_kW = th * 6.0  # kWh per 10-min -> kW
+    if theo_col is not None:
+        th = _coerce_numeric(df[theo_col])  # likely KWh per 10-min
+        # if values look like kWh/10min (small), convert to kW
+        # otherwise if already ~kW keep as is
+        # we assume 10-min logging -> 6× factor
+        TheoP_kW = th * 6.0
 
     out = pd.DataFrame({
         "timestamp": ts,
@@ -147,229 +173,273 @@ def _load_scada_excel(path: str) -> pd.DataFrame:
         "WS_ms": WS_ms,
         "TheoP_kW": TheoP_kW if TheoP_kW is not None else np.nan
     })
-    out = out.dropna(subset=["timestamp"])
-    return out.sort_values("timestamp").reset_index(drop=True)
+    out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return out
 
-def _load_forecasting_excel(path: str) -> pd.DataFrame:
+def _load_forecasting_csv(path: str) -> pd.DataFrame:
     """
-    Reads Turbine_Data.xlsx (10-min features). If it contains a power/energy column,
-    we can derive CF; otherwise we mainly use it for wind-speed-based fallback later.
+    Reader for Turbine_Data.csv:
+      columns: ['Unnamed: 0','ActivePower','AmbientTemp...RotorRPM','TurbineStatus','WTG','WindDirection','WindSpeed']
+    Returns columns: ['timestamp','WS_ms']  (timestamp synthetic if missing)
     """
     if not path or not os.path.exists(path):
-        return pd.DataFrame()
-    df = pd.read_excel(path)
-    # Try to guess timestamp
-    ts_col = None
-    for key in ["Date/Time", "Timestamp", "Datetime", "date", "time", "Date"]:
+        return pd.DataFrame(columns=["timestamp","WS_ms"])
+    df = pd.read_csv(path)
+    # There is no timestamp column in this CSV sample; fabricate a time index at 10-min interval
+    n = len(df)
+    if n == 0:
+        return pd.DataFrame(columns=["timestamp","WS_ms"])
+
+    ws_col = None
+    for key in ["WindSpeed","Wind Speed","WS"]:
         m = [c for c in df.columns if key.lower() in str(c).lower()]
         if m:
-            ts_col = m[0]; break
-    ts = pd.to_datetime(df[ts_col], errors="coerce") if ts_col else pd.to_datetime(df.iloc[:,0], errors="coerce")
+            ws_col = m[0]; break
+    WS_ms = _coerce_numeric(df[ws_col]) if ws_col else pd.Series(np.nan, index=df.index)
 
-    # Guess power/energy column if exists
-    pcol = None
-    for key in ["ActivePower", "Power", "kW", "MW", "Energy", "kWh", "MWh"]:
-        m = [c for c in df.columns if key.lower() in str(c).lower()]
-        if m:
-            pcol = m[0]; break
-    P = pd.to_numeric(df[pcol], errors="coerce") if pcol else np.nan
+    # fabricate start date (won't be used calendar-wise; only for month-of-year bucketing if needed)
+    ts0 = pd.Timestamp("2018-01-01 00:00:00")
+    ts = pd.date_range(start=ts0, periods=n, freq="10min")
+    out = pd.DataFrame({"timestamp": ts, "WS_ms": WS_ms})
+    return out.dropna(subset=["WS_ms"]).reset_index(drop=True)
 
-    out = pd.DataFrame({"timestamp": ts, "value": P})
-    out = out.dropna(subset=["timestamp"])
-    return out.sort_values("timestamp").reset_index(drop=True)
+# ------------------------- Cleaning + Rated Power -------------------------
 
-# ------------------------- SCADA → Monthly CF -------------------------
+def _clean_scada(df: pd.DataFrame, flt: ScadaFilters) -> pd.DataFrame:
+    x = df.copy()
+    for c in ["P_kW","WS_ms","TheoP_kW"]:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=["timestamp"])
 
-def _infer_rated_kw(scada: pd.DataFrame, rated_kw_cfg: Optional[float], use_theo: bool) -> float:
-    if rated_kw_cfg and rated_kw_cfg > 0:
-        return float(rated_kw_cfg)
-    # Prefer theoretical curve if present
-    if use_theo and "TheoP_kW" in scada.columns and scada["TheoP_kW"].notna().any():
+    # auto p_max if not given
+    p_max = flt.p_max_kw
+    if p_max is None and "P_kW" in x and x["P_kW"].notna().sum() > 100:
+        p_max = float(np.nanpercentile(x["P_kW"], 99.9))
+    if p_max is not None:
+        x = x[x["P_kW"].isna() | (x["P_kW"] <= p_max)]
+    if "P_kW" in x:
+        x = x[x["P_kW"].isna() | (x["P_kW"] >= flt.p_min_kw)]
+    if "WS_ms" in x:
+        x = x[x["WS_ms"].isna() | ((x["WS_ms"] >= flt.ws_min) & (x["WS_ms"] <= flt.ws_max))]
+    return x.reset_index(drop=True)
+
+def _infer_rated_kw(scada: pd.DataFrame, cfg: WindCfg) -> float:
+    if cfg.rated_kw and cfg.rated_kw > 0:
+        return float(cfg.rated_kw)
+    if cfg.use_theoretical_power and "TheoP_kW" in scada.columns and scada["TheoP_kW"].notna().any():
         return float(np.nanmax(scada["TheoP_kW"].values))
-    # Else use empirical high quantile of Active Power
-    return float(np.nanpercentile(scada["P_kW"].values, 99.5))
+    if "P_kW" in scada.columns and scada["P_kW"].notna().any():
+        return float(np.nanpercentile(scada["P_kW"].values, 99.5))
+    return 2000.0  # fallback 2 MW
+
+# ------------------------- Power curve -------------------------
+
+def _iec_like_power_curve(rated_kw: float, v: np.ndarray) -> np.ndarray:
+    v_cut_in, v_rated, v_cut_out = 3.0, 12.0, 25.0
+    p = np.zeros_like(v, dtype=float)
+    mask1 = (v >= v_cut_in) & (v < v_rated)
+    p[mask1] = rated_kw * ((v[mask1] - v_cut_in) / (v_rated - v_cut_in))**3
+    mask2 = (v >= v_rated) & (v < v_cut_out)
+    p[mask2] = rated_kw
+    return p
+
+def _fit_power_curve_lowess(scada: pd.DataFrame, rated_kw: float) -> Tuple[np.ndarray, np.ndarray]:
+    x = scada.dropna(subset=["WS_ms","P_kW"]).copy()
+    v_grid = np.linspace(0.0, 30.0, 400)
+    if x.empty or x["P_kW"].abs().sum() < 1e-6:
+        return v_grid, _iec_like_power_curve(rated_kw, v_grid)
+    fit = lowess(endog=np.clip(x["P_kW"].values, 0, rated_kw),
+                 exog=x["WS_ms"].values, frac=0.2, it=3, return_sorted=True)
+    v, p = fit[:,0], fit[:,1]
+    p_grid = np.interp(v_grid, v, p, left=p[0], right=p[-1])
+    p_grid = np.maximum.accumulate(np.clip(p_grid, 0, rated_kw))
+    return v_grid, p_grid
+
+def _p_of_v(v: np.ndarray, v_grid: np.ndarray, p_grid: np.ndarray, rated_kw: float) -> np.ndarray:
+    p = np.interp(v, v_grid, p_grid, left=0.0, right=p_grid[-1])
+    return np.clip(p, 0.0, rated_kw)
+
+# ------------------------- Historical CF from SCADA -------------------------
 
 def _scada_monthly_cf(scada: pd.DataFrame, rated_kw: float) -> pd.DataFrame:
-    """
-    Compute monthly capacity factor from 10-min ActivePower (kW).
-      CF_m = sum(P_kW_i * (10/60)) / (rated_kw * hours_in_month)
-    Returns ['date','cf'] with date at month-end.
-    """
-    x = scada.dropna(subset=["timestamp", "P_kW"]).copy()
+    x = scada.dropna(subset=["timestamp","P_kW"]).copy()
     if x.empty:
         return pd.DataFrame(columns=["date","cf"])
-    x["date"] = pd.to_datetime(x["timestamp"]).dt.to_period("M").dt.to_timestamp("M")
-    # Energy per row in kWh over 10-min
-    x["e_kWh"] = pd.to_numeric(x["P_kW"], errors="coerce") * (10.0/60.0)
-    # Aggregate by month
+    x["date"] = x["timestamp"].dt.to_period("M").dt.to_timestamp("M")
+    # 10-min logging: energy kWh = P_kW * (10/60)
+    x["e_kWh"] = np.clip(x["P_kW"], 0, rated_kw) * (10.0/60.0)
     agg = x.groupby("date", as_index=False).agg(e_kWh=("e_kWh","sum"))
-    # Hours per calendar month
     agg["hours"] = agg["date"].apply(_hours_in_month)
-    agg["cf"] = np.clip((agg["e_kWh"] / (rated_kw * agg["hours"])), 0.0, 1.2)  # allow slight >1 due to noise
-    agg["cf"] = agg["cf"].clip(upper=1.0)
+    agg["cf"] = np.clip(agg["e_kWh"] / (rated_kw * agg["hours"]), 0.0, 1.0)
     return agg[["date","cf"]].sort_values("date").reset_index(drop=True)
 
-def _seasonal_baseline_from_cf(cf_monthly: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """Return seasonal baseline (12 values) and log-residuals."""
-    if cf_monthly is None or cf_monthly.empty:
-        return np.full(12, np.nan), np.array([])
-    cf = cf_monthly.copy()
-    cf["m"] = cf["date"].dt.month
-    seas = cf.groupby("m")["cf"].mean().reindex(range(1,13)).interpolate().to_numpy()
-    # Avoid zeros in log
-    eps = 1e-6
-    cf = cf.merge(pd.DataFrame({"m":np.arange(1,13), "seas":seas}), on="m", how="left")
-    cf["resid"] = np.log((cf["cf"]+eps) / (cf["seas"]+eps))
-    return seas, cf["resid"].to_numpy()
+# ------------------------- Weibull per month-of-year -------------------------
 
-# ------------------------- Plant baseline & Monte Carlo -------------------------
+def _fit_weibull_per_month(ws: pd.Series, cfg: WeibullCfg) -> Dict[int, Tuple[float,float]]:
+    s = pd.DataFrame({"timestamp": ws.index, "WS_ms": ws.values}).dropna()
+    if s.empty:
+        return {}
+    s["m"] = s["timestamp"].dt.month
+    out: Dict[int, Tuple[float,float]] = {}
+    for m in range(1, 13):
+        arr = s.loc[s["m"]==m, "WS_ms"].dropna().values
+        arr = arr[(arr>=0) & (arr<=50)]
+        if arr.size < cfg.min_points_per_month:
+            continue
+        if cfg.fit_loc_zero:
+            k, loc, c = stats.weibull_min.fit(arr, floc=0)
+        else:
+            k, loc, c = stats.weibull_min.fit(arr)
+        out[m] = (k, c)
+    return out
 
-def _degradation_factor(t_month: int, deg_per_year: float) -> float:
-    years = t_month // 12
-    return (1.0 - float(deg_per_year)) ** years
+# ------------------------- CF distributions per month -------------------------
 
-def _plant_mwh_from_cf(cf: float, capacity_mw: float, hours_in_month: float) -> float:
-    return float(capacity_mw) * 1000.0 * hours_in_month * float(cf) / 1000.0  # kWh->MWh
+def _simulate_month_cf_distributions(
+    v_grid: np.ndarray, p_grid: np.ndarray, rated_kw: float,
+    weibull_params: Dict[int, Tuple[float,float]],
+    sim_cfg: SimMonthCF,
+    rng: np.random.Generator
+) -> Dict[int, np.ndarray]:
+    out: Dict[int, np.ndarray] = {}
+    for m in range(1, 13):
+        if m not in weibull_params:
+            continue
+        k, c = weibull_params[m]
+        vv = stats.weibull_min.rvs(k, loc=0, scale=c,
+                                   size=(sim_cfg.reps, sim_cfg.samples_per_month),
+                                   random_state=rng.integers(0, 2**32-1))
+        pp = _p_of_v(vv, v_grid, p_grid, rated_kw)  # kW
+        mean_p = pp.mean(axis=1)
+        cf = np.clip(mean_p / rated_kw, 0.0, 1.0)
+        out[m] = cf
+    return out
 
-def _draw_residuals(n: int, pool: np.ndarray, rng: np.random.Generator, cfg: WindUncertaintyCfg) -> np.ndarray:
-    if cfg.sampler == "student_t":
-        nu = float((cfg.student_t.nu if cfg.student_t else 5.0))
-        z = rng.standard_t(df=nu, size=n)
-        # scale later by histogram σ
-        return z
-    if cfg.sampler == "normal":
-        return rng.normal(size=n)
-    # bootstrap
-    if pool.size == 0:
-        return rng.normal(size=n)
-    return rng.choice(pool, size=n, replace=True)
-
-def _bucket_residuals(res: np.ndarray, months: np.ndarray, mode: str) -> Dict[int, np.ndarray]:
-    if res.size == 0 or mode == "none":
-        return {-1: res}
-    buckets: Dict[int, List[float]] = {}
-    for r, mo in zip(res, months):
-        k = _bucket_key(int(mo), mode)
-        buckets.setdefault(k, []).append(r)
-    return {k: np.array(v, dtype=float) for k, v in buckets.items()}
+# ------------------------- Main sampler -------------------------
 
 def sample_production_paths_monthly(
     n_iter: int,
     months_h: int,
     rng: np.random.Generator,
     cfg_yaml: Dict
-) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """
-    Returns:
-      - paths_mwh:  (n_iter, months_h) plant monthly energy (MWh)
-      - baseline_mwh: (months_h,) deterministic baseline (seasonal CF × plant factors)
-      - hist_cf_monthly: DataFrame with ['date','cf'] if SCADA available
-    """
+) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, Dict[int, np.ndarray]]:
     plant = cfg_yaml.get("plant", {})
     capacity_mw = float(plant.get("capacity_mw", 20.0))
     availability = float(plant.get("availability", 0.97))
     losses = float(plant.get("losses_fraction", 0.10))
     deg = float(plant.get("degradation_per_year", 0.007))
+    plant_factor = availability * (1.0 - losses)
 
-    wind = cfg_yaml.get("wind", {})
+    w = cfg_yaml.get("wind", {})
     wcfg = WindCfg(
-        scada_path=wind.get("scada_path"),
-        forecasting_path=wind.get("forecasting_path"),
-        prefer_source=str(wind.get("prefer_source","scada")),
-        rated_kw=(None if wind.get("rated_kw") in [None, "null"] else float(wind.get("rated_kw"))),
-        use_theoretical_power=bool(wind.get("use_theoretical_power", True)),
-        cf_floor=float(wind.get("cf_floor", 0.02)),
-        cf_cap=float(wind.get("cf_cap", 0.65)),
-        uncertainty=WindUncertaintyCfg(
-            sampler=wind.get("uncertainty",{}).get("sampler","bootstrap"),
-            by_bucket=wind.get("uncertainty",{}).get("by_bucket","month_of_year"),
-            scale=float(wind.get("uncertainty",{}).get("scale",1.0)),
-            calibrate_sigma=(MCVolCalib(
-                target_monthly_sigma=(None if wind.get("uncertainty",{}).get("calibrate_sigma",{}).get("target_monthly_sigma") in [None,"null"] else float(wind.get("uncertainty",{}).get("calibrate_sigma",{}).get("target_monthly_sigma"))),
-                hard_min=float(wind.get("uncertainty",{}).get("calibrate_sigma",{}).get("hard_min",0.5)),
-                hard_max=float(wind.get("uncertainty",{}).get("calibrate_sigma",{}).get("hard_max",2.0)),
-            ) if "calibrate_sigma" in wind.get("uncertainty",{}) else None),
-            student_t=(StudentT(nu=float(wind.get("uncertainty",{}).get("student_t",{}).get("nu",5.0))) if wind.get("uncertainty",{}).get("sampler")=="student_t" else None)
+        scada_path=w.get("scada_path"),
+        forecasting_path=w.get("forecasting_path"),
+        prefer_source=str(w.get("prefer_source","auto")),
+        rated_kw=(None if w.get("rated_kw") in [None, "null"] else float(w.get("rated_kw"))),
+        use_theoretical_power=bool(w.get("use_theoretical_power", True)),
+        scada_filters=ScadaFilters(
+            ws_min=float(w.get("scada_filters",{}).get("ws_min",0.0)),
+            ws_max=float(w.get("scada_filters",{}).get("ws_max",35.0)),
+            p_min_kw=float(w.get("scada_filters",{}).get("p_min_kw",0.0)),
+            p_max_kw=(None if w.get("scada_filters",{}).get("p_max_kw") in [None, "null"] else float(w.get("scada_filters",{}).get("p_max_kw")))
         ),
+        weibull=WeibullCfg(
+            fit_loc_zero=bool(w.get("weibull",{}).get("fit_loc_zero", True)),
+            min_points_per_month=int(w.get("weibull",{}).get("min_points_per_month", 200))
+        ),
+        simulate_month_cf=SimMonthCF(
+            reps=int(w.get("simulate_month_cf",{}).get("reps", 5000)),
+            samples_per_month=int(w.get("simulate_month_cf",{}).get("samples_per_month", 720))
+        ),
+        cf_floor=float(w.get("cf_floor", 0.02)),
+        cf_cap=float(w.get("cf_cap", 0.65)),
         fallback_cf=WindFallbackCF(
-            mean=float(wind.get("fallback_cf",{}).get("mean",0.35)),
-            std=float(wind.get("fallback_cf",{}).get("std",0.05)),
-            min=float(wind.get("fallback_cf",{}).get("min",0.05)),
-            max=float(wind.get("fallback_cf",{}).get("max",0.60)),
+            mean=float(w.get("fallback_cf",{}).get("mean",0.35)),
+            std=float(w.get("fallback_cf",{}).get("std",0.05)),
+            min=float(w.get("fallback_cf",{}).get("min",0.10)),
+            max=float(w.get("fallback_cf",{}).get("max",0.55)),
         )
     )
 
-    # ---------- 1) Historical monthly CF from SCADA if available ----------
-    hist_cf_monthly = pd.DataFrame(columns=["date","cf"])
-    rated_kw = None
-    if wcfg.scada_path and os.path.exists(wcfg.scada_path):
-        scada = _load_scada_excel(wcfg.scada_path)
-        if not scada.empty and scada["P_kW"].notna().any():
-            rated_kw = _infer_rated_kw(scada, wcfg.rated_kw, wcfg.use_theoretical_power)
-            hist_cf_monthly = _scada_monthly_cf(scada, rated_kw)
+    # Load & clean SCADA
+    scada = _load_scada(wcfg.scada_path)
+    scada = _clean_scada(scada, wcfg.scada_filters)
 
-    # ---------- 2) Seasonal baseline CF ----------
-    if not hist_cf_monthly.empty:
-        seasonal_cf, resid_log = _seasonal_baseline_from_cf(hist_cf_monthly)
-        months_hist = hist_cf_monthly["date"].dt.month.to_numpy()
-        sigma_hist = float(np.std(resid_log, ddof=1)) if resid_log.size > 1 else 0.0
+    # Forecast dataset
+    fore = _load_forecasting_csv(wcfg.forecasting_path)
+
+    # Rated power
+    rated_kw = _infer_rated_kw(scada, wcfg)
+    print(f"[INFO] SCADA rows={len(scada)}, non-null P_kW={scada['P_kW'].notna().sum()}, non-null WS_ms={scada['WS_ms'].notna().sum()}")
+    print(f"[INFO] Forecast rows={len(fore)}, non-null WS_ms={fore['WS_ms'].notna().sum()}")
+    print(f"[INFO] Inferred rated_kW={rated_kw:.1f}")
+
+    # Historical CF from SCADA
+    hist_cf = _scada_monthly_cf(scada, rated_kw)
+
+    # Power curve
+    v_grid, p_grid = _fit_power_curve_lowess(scada, rated_kw)
+
+    # Combined wind-speed series
+    ws_scada = scada.dropna(subset=["WS_ms"]).set_index("timestamp")["WS_ms"] if not scada.empty else pd.Series(dtype=float)
+    ws_fore  = fore.set_index("timestamp")["WS_ms"] if not fore.empty else pd.Series(dtype=float)
+    if wcfg.prefer_source == "scada":
+        ws_all = ws_scada
+    elif wcfg.prefer_source == "forecasting":
+        ws_all = ws_fore
     else:
-        # No history: flat seasonal profile at fallback mean
-        seasonal_cf = np.full(12, float(wcfg.fallback_cf.mean))
-        resid_log = np.array([])
-        months_hist = np.array([], dtype=int)
-        sigma_hist = 0.0
+        ws_all = pd.concat([ws_scada, ws_fore]).sort_index()
 
-    # Plant-level multiplicative factor (availability & losses)
-    plant_factor = float(availability) * (1.0 - float(losses))
+    # Weibull params
+    weibull_params = _fit_weibull_per_month(ws_all, wcfg.weibull)
+    if not weibull_params:
+        # fall back to constant CF draws
+        baseline_mwh = np.zeros(months_h)
+        paths_mwh = np.zeros((n_iter, months_h))
+        mu, sd = wcfg.fallback_cf.mean, wcfg.fallback_cf.std
+        for t in range(months_h):
+            years = t // 12
+            cf = np.clip(np.random.normal(mu, sd), wcfg.fallback_cf.min, wcfg.fallback_cf.max)
+            cf *= plant_factor * ((1.0 - deg) ** years)
+            mwh = cf * capacity_mw * 30.4375 * 24.0
+            baseline_mwh[t] = mwh
+            paths_mwh[:, t] = mwh
+        return paths_mwh, baseline_mwh, hist_cf, {}
 
-    # Baseline CF path for horizon (seasonal × plant factor × degradation-by-year)
-    baseline_cf = np.zeros(months_h, dtype=float)
-    baseline_mwh = np.zeros(months_h, dtype=float)
+    # CF distributions by month-of-year
+    cf_dist_by_month = _simulate_month_cf_distributions(v_grid, p_grid, rated_kw, weibull_params, wcfg.simulate_month_cf, np.random.default_rng(1234))
+
+    # Baseline CF per month-of-year
+    baseline_cf_moy = np.array([np.nanmean(cf_dist_by_month[m]) if m in cf_dist_by_month else np.nan for m in range(1,13)])
+    s = pd.Series(baseline_cf_moy).interpolate(limit_direction="both")
+    baseline_cf_moy = np.clip(s.to_numpy(), wcfg.cf_floor, wcfg.cf_cap)
+
+    # Build horizon
+    baseline_mwh = np.zeros(months_h)
+    paths_mwh = np.zeros((n_iter, months_h))
+    rng_local = np.random.default_rng(int(cfg_yaml.get("monte_carlo",{}).get("random_seed",42)))
+
     for t in range(months_h):
         mo = (t % 12) + 1
-        cf0 = seasonal_cf[mo-1]
-        cf0 = np.clip(cf0, wcfg.cf_floor, wcfg.cf_cap)
-        cf0 *= plant_factor
-        cf0 *= _degradation_factor(t, deg)
-        baseline_cf[t] = cf0
-        # hours in the t-th month — approximate with 30.4375*24 if Jalali not mapped here
-        # We'll compute hours from Gregorian series in __main__ when plotting; here use 30*24 for calc
-        baseline_mwh[t] = cf0 * capacity_mw * 30.4375 * 24.0  # ≈ average month hours
+        years = t // 12
+        cf_draws = cf_dist_by_month.get(mo, np.array([wcfg.fallback_cf.mean]))
+        cf_s = rng_local.choice(cf_draws, size=n_iter, replace=True)
+        cf_s = np.clip(cf_s, wcfg.cf_floor, wcfg.cf_cap)
+        cf_s *= plant_factor * ((1.0 - deg) ** years)
+        mwh = cf_s * capacity_mw * 30.4375 * 24.0
+        paths_mwh[:, t] = mwh
 
-    # ---------- 3) Monte Carlo around baseline ----------
-    # Residual buckets for bootstrap / controls for student_t / normal
-    buckets = _bucket_residuals(resid_log, months_hist, wcfg.uncertainty.by_bucket)
-    scale = _calibrate_scale(sigma_hist, wcfg.uncertainty)
-    if scale == 0.0:
-        paths_mwh = np.tile(baseline_mwh, (n_iter, 1))
-        return paths_mwh, baseline_mwh, hist_cf_monthly
+        base_cf = baseline_cf_moy[mo-1] * plant_factor * ((1.0 - deg) ** years)
+        baseline_mwh[t] = base_cf * capacity_mw * 30.4375 * 24.0
 
-    # Draw log-residuals by month bucket and exponentiate around baseline CF
-    paths_mwh = np.zeros((n_iter, months_h), dtype=float)
-    for t in range(months_h):
-        mo = (t % 12) + 1
-        key = _bucket_key(mo, wcfg.uncertainty.by_bucket)
-        pool = buckets.get(key, resid_log)
-        z = _draw_residuals(n_iter, pool, rng, wcfg.uncertainty)
-        # If student_t/normal, scale to hist sigma; if bootstrap, scale acts as multiplier of hist σ implicitly
-        if wcfg.uncertainty.sampler in ["student_t", "normal"]:
-            z = z * (sigma_hist if sigma_hist > 0 else 1.0)
-        eps = z * float(scale)
-        cf_t = baseline_cf[t] * np.exp(eps)
-        cf_t = np.clip(cf_t, wcfg.cf_floor, wcfg.cf_cap)
-        paths_mwh[:, t] = cf_t * capacity_mw * 30.4375 * 24.0
+    return paths_mwh, baseline_mwh, hist_cf, cf_dist_by_month
 
-    return paths_mwh, baseline_mwh, hist_cf_monthly
+# ------------------------- Plot helpers -------------------------
 
-# ------------------------- __main__: simulate & plot -------------------------
+def _percentiles_matrix(paths: np.ndarray, qs: List[float]) -> np.ndarray:
+    return np.percentile(paths, qs, axis=0)
 
-def _load_yaml_config(path: str) -> Dict:
-    import yaml
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-# Optional Jalali month helper (re-using approach from price_model)
 try:
     import jdatetime
     HAS_JDATE = True
@@ -387,22 +457,18 @@ def _jalali_month_range(start_y: int, start_m: int, end_y: int, end_m: int) -> L
         g = jdatetime.date(y, m, 1).togregorian()
         ts = pd.Timestamp(g.year, g.month, 1) + pd.offsets.MonthEnd(0)
         out.append(ts)
-        if m == 12:
-            y += 1
-            m = 1
-        else:
-            m += 1
+        if m == 12: y += 1; m = 1
+        else: m += 1
     return out
 
-def _percentiles_matrix(paths: np.ndarray, qs: List[float]) -> np.ndarray:
-    return np.percentile(paths, qs, axis=0)
+# ------------------------- __main__ -------------------------
 
 if __name__ == "__main__":
     CODEBASE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     CONFIG_PATH = os.path.join(CODEBASE, "config.yaml")
     cfg_yaml = _load_yaml_config(CONFIG_PATH)
 
-    # Horizon: 1404/01 → 1414/12 (132 months)
+    # horizon 1404/01 → 1414/12
     start_jy, start_jm = 1404, 1
     end_jy, end_jm = 1414, 12
     horizon_months = (end_jy - start_jy) * 12 + (end_jm - start_jm) + 1
@@ -412,55 +478,57 @@ if __name__ == "__main__":
     seed = int(cfg_yaml.get("monte_carlo", {}).get("random_seed", 42))
     rng = np.random.default_rng(seed)
 
-    # Simulate
-    paths_mwh, baseline_mwh, hist_cf = sample_production_paths_monthly(
+    paths_mwh, baseline_mwh, hist_cf, _ = sample_production_paths_monthly(
         n_iter=n_iter, months_h=horizon_months, rng=rng, cfg_yaml=cfg_yaml
     )
 
-    # ---- Plot 0: Historical CF (from SCADA) ----
+    # Plot 0: Historical CF
     if hist_cf is not None and not hist_cf.empty:
-        plt.figure(figsize=(12, 3.5))
+        plt.figure(figsize=(12, 3.2))
         plt.plot(hist_cf["date"], hist_cf["cf"], label="Historical CF (monthly)")
         plt.title("Historical Monthly Capacity Factor (SCADA)")
-        plt.xlabel("Month (Gregorian)")
-        plt.ylabel("Capacity Factor (ratio)")
-        plt.ylim(0, 1.0)
-        plt.legend()
-        f0 = os.path.join(CODEBASE, "wind_hist_cf.png")
-        plt.tight_layout()
-        plt.savefig(f0, dpi=150)
+        plt.xlabel("Month (Gregorian)"); plt.ylabel("Capacity Factor"); plt.ylim(0, 1.0)
+        plt.legend(); f0 = os.path.join(CODEBASE, "wind_hist_cf.png")
+        plt.tight_layout(); plt.savefig(f0, dpi=150)
 
-    # ---- Plot 1: Fan chart of plant monthly MWh ----
+    # Power curve figure
+    # Recompute for plot (using same loaders)
+    scada_plot = _clean_scada(_load_scada(cfg_yaml.get("wind",{}).get("scada_path","")), ScadaFilters())
+    rated_plot = _infer_rated_kw(scada_plot, WindCfg(None,None))
+    v_grid, p_grid = _fit_power_curve_lowess(scada_plot, rated_plot)
+    plt.figure(figsize=(8,4))
+    plt.plot(v_grid, p_grid, label="Power curve (LOWESS or IEC fallback)")
+    plt.title("Empirical Power Curve (kW vs m/s)")
+    plt.xlabel("Wind speed (m/s)"); plt.ylabel("Power (kW)"); plt.legend()
+    fpc = os.path.join(CODEBASE, "wind_power_curve.png")
+    plt.tight_layout(); plt.savefig(fpc, dpi=150)
+
+    # Fan chart
     qs = [5, 50, 95]
     qmat = _percentiles_matrix(paths_mwh, qs)
     plt.figure(figsize=(12, 4))
-    plt.plot(x_dates, baseline_mwh, label="Baseline (seasonal × availability × losses × degradation)")
+    plt.plot(x_dates, baseline_mwh, label="Baseline (seasonal × availability × losses × degradation)", zorder=3)
     plt.plot(x_dates, qmat[1], label="P50")
     plt.fill_between(x_dates, qmat[0], qmat[2], alpha=0.2, label="P5–P95")
     plt.title("Monthly Energy Production (MWh) — Baseline + Stochastic Fan")
-    plt.xlabel("Month (Gregorian)")
-    plt.ylabel("Energy (MWh)")
-    plt.legend()
+    plt.xlabel("Month (Gregorian)"); plt.ylabel("Energy (MWh)"); plt.legend()
     f1 = os.path.join(CODEBASE, "wind_sampler_fan_chart.png")
-    plt.tight_layout()
-    plt.savefig(f1, dpi=150)
+    plt.tight_layout(); plt.savefig(f1, dpi=150)
 
-    # ---- Plot 2: Percentile heatmap ----
+    # Heatmap
     qs_dense = list(range(5, 100, 5))
     qmat_dense = _percentiles_matrix(paths_mwh, qs_dense)
     plt.figure(figsize=(12, 5))
     plt.imshow(qmat_dense, aspect="auto", origin="lower")
     plt.title("Percentile Heatmap of Simulated Monthly Energy (MWh)")
-    plt.xlabel("Time (months 1404→1414)")
-    plt.ylabel("Percentile (5→95)")
+    plt.xlabel("Time (months 1404→1414)"); plt.ylabel("Percentile (5→95)")
     xticks = np.linspace(0, horizon_months - 1, 12, dtype=int)
     plt.xticks(xticks, [x_dates[i].strftime("%Y-%m") for i in xticks], rotation=45, ha="right")
-    yticks = np.arange(len(qs_dense))
-    plt.yticks(yticks, [str(q) for q in qs_dense])
+    yticks = np.arange(len(qs_dense)); plt.yticks(yticks, [str(q) for q in qs_dense])
     f2 = os.path.join(CODEBASE, "wind_sampler_heatmap.png")
-    plt.tight_layout()
-    plt.savefig(f2, dpi=150)
+    plt.tight_layout(); plt.savefig(f2, dpi=150)
 
     print("Saved:", (f0 if 'f0' in locals() else "(no historical CF plot)"))
+    print("Saved:", fpc)
     print("Saved:", f1)
     print("Saved:", f2)
