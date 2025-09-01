@@ -1,0 +1,57 @@
+project:
+  name: "Wind MVP - Iran Market (IRENEX)"
+  years: 10
+  currency: "IRR"
+  irr_per_usd: 1000000
+  discount_rate: 0.12
+
+plant:
+  capacity_mw: 20.0
+  availability: 0.97
+  losses_fraction: 0.10
+  degradation_per_year: 0.007
+
+costs:
+  capex_usd_per_kw: 1154
+  opex_usd_per_kw_yr: 43
+  inflation_opex: 0.20
+  debt_ratio: 1.0
+  loan_rate: 0.18
+
+price:
+  iran_daily_path: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\Iran Energy Price Datasets\\آمار_بازار_عمده_فروشی_و_مصرف_کنندگان_بزرگ_برق-بورس_انرژی.xlsx"
+  use_vwap: true
+  fallback_price_irr_per_mwh: 20000000
+
+  volatility:
+    sampler: "bootstrap"     # bootstrap | student_t
+    by_bucket: "month_of_year"   # month_of_year | season3 | none
+    scale: 1.0               # اگر calibration فعال شود، این نادیده گرفته می‌شود
+    calibrate_sigma:         # اختیاری: اگر مقدار بدهی فعال می‌شود
+      target_monthly_sigma:  null   # مثلا 0.18  (σ هدف روی لگاریتم قیمت)
+      hard_min: 0.5                # حداقل scale
+      hard_max: 2.0                # حداکثر scale
+    student_t:
+      nu: 5.0                # df برای Student-t (اگر sampler=student_t)
+
+  # Inflation / trend (non-stationary drift)
+  inflation:
+    scenario: baseline           # baseline | piecewise | custom_path
+    pass_through: 1.0            # fraction of this inflation applied to ENERGY PRICES
+    baseline:
+      annual_rate: 0.35          # ~35%/yr -> converted to monthly inside the model
+    # piecewise:
+    #   - months: 24
+    #     annual_rate: 0.40
+    #   - months: 36
+    #     annual_rate: 0.25
+    # custom_path:
+    #   monthly_rates: []        # list of monthly rates (length >= horizon); e.g., [0.02, 0.025, ...]
+
+monte_carlo:
+  iterations: 10000
+  random_seed: 42
+  cf_mean: 0.35
+  cf_std: 0.05
+  cf_min: 0.05
+  cf_max: 0.60
