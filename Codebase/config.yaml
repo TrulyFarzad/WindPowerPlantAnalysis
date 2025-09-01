@@ -24,29 +24,28 @@ price:
   fallback_price_irr_per_mwh: 20000000
 
   volatility:
-    sampler: "bootstrap"     # bootstrap | student_t
+    sampler: "bootstrap"      # bootstrap | student_t
     by_bucket: "month_of_year"   # month_of_year | season3 | none
-    scale: 1.0               # اگر calibration فعال شود، این نادیده گرفته می‌شود
-    calibrate_sigma:         # اختیاری: اگر مقدار بدهی فعال می‌شود
-      target_monthly_sigma:  null   # مثلا 0.18  (σ هدف روی لگاریتم قیمت)
-      hard_min: 0.5                # حداقل scale
-      hard_max: 2.0                # حداکثر scale
+    scale: 1.0
+    calibrate_sigma:
+      target_monthly_sigma: null   # e.g. 0.18 for σ calibration
+      hard_min: 0.5
+      hard_max: 2.0
     student_t:
-      nu: 5.0                # df برای Student-t (اگر sampler=student_t)
+      nu: 5.0
 
-  # Inflation / trend (non-stationary drift)
   inflation:
-    scenario: baseline           # baseline | piecewise | custom_path
-    pass_through: 1.0            # fraction of this inflation applied to ENERGY PRICES
+    scenario: baseline          # baseline | piecewise | custom_path
+    pass_through: 1.0
     baseline:
-      annual_rate: 0.35          # ~35%/yr -> converted to monthly inside the model
+      annual_rate: 0.35
     # piecewise:
     #   - months: 24
     #     annual_rate: 0.40
     #   - months: 36
     #     annual_rate: 0.25
     # custom_path:
-    #   monthly_rates: []        # list of monthly rates (length >= horizon); e.g., [0.02, 0.025, ...]
+    #   monthly_rates: []
 
 monte_carlo:
   iterations: 10000
@@ -60,15 +59,22 @@ wind:
   scada_path: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\wind turbine scada dataset\\T1.csv"
   forecasting_path: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\wind power forecasting\\Turbine_Data.csv"
 
-  prefer_source: "auto"        # auto | scada | forecasting
-  rated_kw: null               # اگر null باشد از داده کشف می‌شود (TheoPower یا 99.5% Active)
+  # --- NEW: flexibility ---
+  power_curve_source: "theoretical"   # "lowess" | "theoretical" | "auto"
+  prefer_source: "auto"               # auto | scada | forecasting
+
+  rated_kw: null
   use_theoretical_power: true
+
+  # calibration knobs
+  cf_calibration: 1.2
+  fallback_if_mean_cf_below: 0.15
 
   scada_filters:
     ws_min: 0.0
     ws_max: 35.0
     p_min_kw: 0.0
-    p_max_kw: null             # اگر null باشد خودکار 99.9% امپریک
+    p_max_kw: null
 
   weibull:
     fit_loc_zero: true

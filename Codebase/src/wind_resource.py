@@ -55,6 +55,7 @@ class WindCfg:
     prefer_source: str = "auto"   # auto | scada | forecasting
     rated_kw: Optional[float] = None
     use_theoretical_power: bool = True
+    power_curve_source: str = "auto"  # NEW: lowess | theoretical | auto
     scada_filters: ScadaFilters = field(default_factory=ScadaFilters)
     weibull: WeibullCfg = field(default_factory=WeibullCfg)
     simulate_month_cf: SimMonthCF = field(default_factory=SimMonthCF)
@@ -80,7 +81,6 @@ def _hours_in_month(ts: pd.Timestamp) -> float:
     return (end - start).total_seconds() / 3600.0
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
-    # handle decimal comma and stray chars
     return pd.to_numeric(
         series.astype(str)
               .str.replace(",", ".", regex=False)
@@ -91,15 +91,6 @@ def _coerce_numeric(series: pd.Series) -> pd.Series:
 # ------------------------- Robust loaders -------------------------
 
 def _load_scada(path: str) -> pd.DataFrame:
-    """
-    Robust reader for T1.csv or Excel:
-      Expected columns (case-insensitive, flexible):
-        - Date/Time
-        - LV ActivePower (kW)
-        - Wind Speed (m/s)
-        - Theoretical_Power_Curve (KWh)  [optional]
-    Returns: ['timestamp','P_kW','WS_ms','TheoP_kW'] (some may be NaN).
-    """
     if not path or not os.path.exists(path):
         return pd.DataFrame(columns=["timestamp","P_kW","WS_ms","TheoP_kW"])
 
@@ -107,10 +98,8 @@ def _load_scada(path: str) -> pd.DataFrame:
     if ext in [".csv", ".txt"]:
         df = pd.read_csv(path)
     else:
-        # Excel (single or multi-sheet)
         try:
             xls = pd.ExcelFile(path)
-            # pick sheet with most of the expected columns
             best, best_score = None, -1
             for sh in xls.sheet_names:
                 tdf = pd.read_excel(xls, sheet_name=sh)
@@ -122,7 +111,6 @@ def _load_scada(path: str) -> pd.DataFrame:
         except Exception:
             df = pd.read_excel(path)
 
-    # map columns
     cols = {str(c).strip(): c for c in df.columns}
 
     # timestamp
@@ -152,7 +140,7 @@ def _load_scada(path: str) -> pd.DataFrame:
         if ws_col is not None: break
     WS_ms = _coerce_numeric(df[ws_col]) if ws_col is not None else pd.Series(np.nan, index=df.index)
 
-    # Theoretical power (KWh per 10-min) -> kW
+    # Theoretical power
     theo_col = None
     for key in ["Theoretical_Power_Curve", "Theoretical", "Curve"]:
         for c in cols:
@@ -161,11 +149,8 @@ def _load_scada(path: str) -> pd.DataFrame:
         if theo_col is not None: break
     TheoP_kW = None
     if theo_col is not None:
-        th = _coerce_numeric(df[theo_col])  # likely KWh per 10-min
-        # if values look like kWh/10min (small), convert to kW
-        # otherwise if already ~kW keep as is
-        # we assume 10-min logging -> 6× factor
-        TheoP_kW = th * 6.0
+        th = _coerce_numeric(df[theo_col])
+        TheoP_kW = th * 6.0  # 10-min logging
 
     out = pd.DataFrame({
         "timestamp": ts,
@@ -177,15 +162,9 @@ def _load_scada(path: str) -> pd.DataFrame:
     return out
 
 def _load_forecasting_csv(path: str) -> pd.DataFrame:
-    """
-    Reader for Turbine_Data.csv:
-      columns: ['Unnamed: 0','ActivePower','AmbientTemp...RotorRPM','TurbineStatus','WTG','WindDirection','WindSpeed']
-    Returns columns: ['timestamp','WS_ms']  (timestamp synthetic if missing)
-    """
     if not path or not os.path.exists(path):
         return pd.DataFrame(columns=["timestamp","WS_ms"])
     df = pd.read_csv(path)
-    # There is no timestamp column in this CSV sample; fabricate a time index at 10-min interval
     n = len(df)
     if n == 0:
         return pd.DataFrame(columns=["timestamp","WS_ms"])
@@ -197,7 +176,6 @@ def _load_forecasting_csv(path: str) -> pd.DataFrame:
             ws_col = m[0]; break
     WS_ms = _coerce_numeric(df[ws_col]) if ws_col else pd.Series(np.nan, index=df.index)
 
-    # fabricate start date (won't be used calendar-wise; only for month-of-year bucketing if needed)
     ts0 = pd.Timestamp("2018-01-01 00:00:00")
     ts = pd.date_range(start=ts0, periods=n, freq="10min")
     out = pd.DataFrame({"timestamp": ts, "WS_ms": WS_ms})
@@ -212,7 +190,6 @@ def _clean_scada(df: pd.DataFrame, flt: ScadaFilters) -> pd.DataFrame:
             x[c] = pd.to_numeric(x[c], errors="coerce")
     x = x.dropna(subset=["timestamp"])
 
-    # auto p_max if not given
     p_max = flt.p_max_kw
     if p_max is None and "P_kW" in x and x["P_kW"].notna().sum() > 100:
         p_max = float(np.nanpercentile(x["P_kW"], 99.9))
@@ -231,7 +208,7 @@ def _infer_rated_kw(scada: pd.DataFrame, cfg: WindCfg) -> float:
         return float(np.nanmax(scada["TheoP_kW"].values))
     if "P_kW" in scada.columns and scada["P_kW"].notna().any():
         return float(np.nanpercentile(scada["P_kW"].values, 99.5))
-    return 2000.0  # fallback 2 MW
+    return 2000.0
 
 # ------------------------- Power curve -------------------------
 
@@ -244,17 +221,30 @@ def _iec_like_power_curve(rated_kw: float, v: np.ndarray) -> np.ndarray:
     p[mask2] = rated_kw
     return p
 
-def _fit_power_curve_lowess(scada: pd.DataFrame, rated_kw: float) -> Tuple[np.ndarray, np.ndarray]:
-    x = scada.dropna(subset=["WS_ms","P_kW"]).copy()
+def _fit_power_curve(scada: pd.DataFrame, rated_kw: float, source: str="auto") -> Tuple[np.ndarray, np.ndarray]:
     v_grid = np.linspace(0.0, 30.0, 400)
-    if x.empty or x["P_kW"].abs().sum() < 1e-6:
-        return v_grid, _iec_like_power_curve(rated_kw, v_grid)
-    fit = lowess(endog=np.clip(x["P_kW"].values, 0, rated_kw),
-                 exog=x["WS_ms"].values, frac=0.2, it=3, return_sorted=True)
-    v, p = fit[:,0], fit[:,1]
-    p_grid = np.interp(v_grid, v, p, left=p[0], right=p[-1])
-    p_grid = np.maximum.accumulate(np.clip(p_grid, 0, rated_kw))
-    return v_grid, p_grid
+
+    if source == "theoretical" and "TheoP_kW" in scada and scada["TheoP_kW"].notna().any():
+        x = scada.dropna(subset=["WS_ms", "TheoP_kW"])
+        bins = np.linspace(0, 30, 60)
+        labels = np.digitize(x["WS_ms"], bins) - 1
+        gb = x.groupby(labels)["TheoP_kW"].mean()
+        gb = gb.reindex(range(len(bins)-1), fill_value=0.0)
+        p_grid = np.interp(v_grid, bins[:-1], gb.values, left=0, right=rated_kw)
+        return v_grid, np.clip(p_grid, 0, rated_kw)
+
+    if source in ["lowess", "auto"]:
+        x = scada.dropna(subset=["WS_ms","P_kW"])
+        if not x.empty and x["P_kW"].abs().sum() > 1e-6:
+            fit = lowess(
+                endog=np.clip(x["P_kW"].values, 0, rated_kw),
+                exog=x["WS_ms"].values, frac=0.2, it=3, return_sorted=True
+            )
+            v, p = fit[:,0], fit[:,1]
+            p_grid = np.interp(v_grid, v, p, left=p[0], right=p[-1])
+            return v_grid, np.maximum.accumulate(np.clip(p_grid, 0, rated_kw))
+
+    return v_grid, _iec_like_power_curve(rated_kw, v_grid)
 
 def _p_of_v(v: np.ndarray, v_grid: np.ndarray, p_grid: np.ndarray, rated_kw: float) -> np.ndarray:
     p = np.interp(v, v_grid, p_grid, left=0.0, right=p_grid[-1])
@@ -267,7 +257,6 @@ def _scada_monthly_cf(scada: pd.DataFrame, rated_kw: float) -> pd.DataFrame:
     if x.empty:
         return pd.DataFrame(columns=["date","cf"])
     x["date"] = x["timestamp"].dt.to_period("M").dt.to_timestamp("M")
-    # 10-min logging: energy kWh = P_kW * (10/60)
     x["e_kWh"] = np.clip(x["P_kW"], 0, rated_kw) * (10.0/60.0)
     agg = x.groupby("date", as_index=False).agg(e_kWh=("e_kWh","sum"))
     agg["hours"] = agg["date"].apply(_hours_in_month)
@@ -310,7 +299,7 @@ def _simulate_month_cf_distributions(
         vv = stats.weibull_min.rvs(k, loc=0, scale=c,
                                    size=(sim_cfg.reps, sim_cfg.samples_per_month),
                                    random_state=rng.integers(0, 2**32-1))
-        pp = _p_of_v(vv, v_grid, p_grid, rated_kw)  # kW
+        pp = _p_of_v(vv, v_grid, p_grid, rated_kw)
         mean_p = pp.mean(axis=1)
         cf = np.clip(mean_p / rated_kw, 0.0, 1.0)
         out[m] = cf
@@ -338,6 +327,7 @@ def sample_production_paths_monthly(
         prefer_source=str(w.get("prefer_source","auto")),
         rated_kw=(None if w.get("rated_kw") in [None, "null"] else float(w.get("rated_kw"))),
         use_theoretical_power=bool(w.get("use_theoretical_power", True)),
+        power_curve_source=str(w.get("power_curve_source", "auto")),
         scada_filters=ScadaFilters(
             ws_min=float(w.get("scada_filters",{}).get("ws_min",0.0)),
             ws_max=float(w.get("scada_filters",{}).get("ws_max",35.0)),
@@ -379,7 +369,7 @@ def sample_production_paths_monthly(
     hist_cf = _scada_monthly_cf(scada, rated_kw)
 
     # Power curve
-    v_grid, p_grid = _fit_power_curve_lowess(scada, rated_kw)
+    v_grid, p_grid = _fit_power_curve(scada, rated_kw, wcfg.power_curve_source)
 
     # Combined wind-speed series
     ws_scada = scada.dropna(subset=["WS_ms"]).set_index("timestamp")["WS_ms"] if not scada.empty else pd.Series(dtype=float)
@@ -394,7 +384,6 @@ def sample_production_paths_monthly(
     # Weibull params
     weibull_params = _fit_weibull_per_month(ws_all, wcfg.weibull)
     if not weibull_params:
-        # fall back to constant CF draws
         baseline_mwh = np.zeros(months_h)
         paths_mwh = np.zeros((n_iter, months_h))
         mu, sd = wcfg.fallback_cf.mean, wcfg.fallback_cf.std
@@ -407,15 +396,12 @@ def sample_production_paths_monthly(
             paths_mwh[:, t] = mwh
         return paths_mwh, baseline_mwh, hist_cf, {}
 
-    # CF distributions by month-of-year
     cf_dist_by_month = _simulate_month_cf_distributions(v_grid, p_grid, rated_kw, weibull_params, wcfg.simulate_month_cf, np.random.default_rng(1234))
 
-    # Baseline CF per month-of-year
     baseline_cf_moy = np.array([np.nanmean(cf_dist_by_month[m]) if m in cf_dist_by_month else np.nan for m in range(1,13)])
     s = pd.Series(baseline_cf_moy).interpolate(limit_direction="both")
     baseline_cf_moy = np.clip(s.to_numpy(), wcfg.cf_floor, wcfg.cf_cap)
 
-    # Build horizon
     baseline_mwh = np.zeros(months_h)
     paths_mwh = np.zeros((n_iter, months_h))
     rng_local = np.random.default_rng(int(cfg_yaml.get("monte_carlo",{}).get("random_seed",42)))
@@ -468,7 +454,6 @@ if __name__ == "__main__":
     CONFIG_PATH = os.path.join(CODEBASE, "config.yaml")
     cfg_yaml = _load_yaml_config(CONFIG_PATH)
 
-    # horizon 1404/01 → 1414/12
     start_jy, start_jm = 1404, 1
     end_jy, end_jm = 1414, 12
     horizon_months = (end_jy - start_jy) * 12 + (end_jm - start_jm) + 1
@@ -482,7 +467,6 @@ if __name__ == "__main__":
         n_iter=n_iter, months_h=horizon_months, rng=rng, cfg_yaml=cfg_yaml
     )
 
-    # Plot 0: Historical CF
     if hist_cf is not None and not hist_cf.empty:
         plt.figure(figsize=(12, 3.2))
         plt.plot(hist_cf["date"], hist_cf["cf"], label="Historical CF (monthly)")
@@ -491,11 +475,9 @@ if __name__ == "__main__":
         plt.legend(); f0 = os.path.join(CODEBASE, "wind_hist_cf.png")
         plt.tight_layout(); plt.savefig(f0, dpi=150)
 
-    # Power curve figure
-    # Recompute for plot (using same loaders)
     scada_plot = _clean_scada(_load_scada(cfg_yaml.get("wind",{}).get("scada_path","")), ScadaFilters())
     rated_plot = _infer_rated_kw(scada_plot, WindCfg(None,None))
-    v_grid, p_grid = _fit_power_curve_lowess(scada_plot, rated_plot)
+    v_grid, p_grid = _fit_power_curve(scada_plot, rated_plot)
     plt.figure(figsize=(8,4))
     plt.plot(v_grid, p_grid, label="Power curve (LOWESS or IEC fallback)")
     plt.title("Empirical Power Curve (kW vs m/s)")
@@ -503,7 +485,6 @@ if __name__ == "__main__":
     fpc = os.path.join(CODEBASE, "wind_power_curve.png")
     plt.tight_layout(); plt.savefig(fpc, dpi=150)
 
-    # Fan chart
     qs = [5, 50, 95]
     qmat = _percentiles_matrix(paths_mwh, qs)
     plt.figure(figsize=(12, 4))
@@ -515,7 +496,6 @@ if __name__ == "__main__":
     f1 = os.path.join(CODEBASE, "wind_sampler_fan_chart.png")
     plt.tight_layout(); plt.savefig(f1, dpi=150)
 
-    # Heatmap
     qs_dense = list(range(5, 100, 5))
     qmat_dense = _percentiles_matrix(paths_mwh, qs_dense)
     plt.figure(figsize=(12, 5))
