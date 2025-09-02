@@ -1,0 +1,8 @@
+numpy
+pandas
+matplotlib
+PyYAML
+scipy
+statsmodels
+jdatetime
+openpyxl

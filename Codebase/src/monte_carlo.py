@@ -21,6 +21,7 @@ Outputs (saved next to config.yaml):
   - mc_cumcash_fan.png
 """
 
+# --- imports (top of src/monte_carlo.py) ---
 from __future__ import annotations
 import os
 from typing import Dict, Tuple, List
@@ -28,16 +29,29 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ------- local modules (از cashflow همه چیز رو می‌گیریم) -------
-from cashflow import (
-    _load_yaml_config,
-    _monthly_rate,
-    _npv_monthly,
-    _irr_monthly,
-    build_monthly_vectors,
-    build_cashflows,
-    evaluate_paths,
-)
+# Robust intra-package imports: try package-relative first, fallback to local
+try:
+    from .cashflow import (
+        _load_yaml_config,
+        _monthly_rate,
+        _npv_monthly,
+        _irr_monthly,
+        build_monthly_vectors,
+        build_cashflows,
+        evaluate_paths,
+    )
+    from .wind_resource import _jalali_month_range  # for consistent date axis
+except ImportError:
+    from cashflow import (
+        _load_yaml_config,
+        _monthly_rate,
+        _npv_monthly,
+        _irr_monthly,
+        build_monthly_vectors,
+        build_cashflows,
+        evaluate_paths,
+    )
+    from wind_resource import _jalali_month_range
 
 # ----------------------------- helpers -----------------------------
 

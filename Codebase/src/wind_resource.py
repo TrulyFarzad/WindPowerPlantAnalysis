@@ -436,7 +436,7 @@ def _jalali_month_range(start_y: int, start_m: int, end_y: int, end_m: int) -> L
     if not HAS_JDATE:
         months = (end_y - start_y) * 12 + (end_m - start_m) + 1
         start = pd.Timestamp.today().normalize().replace(day=1)
-        return list(pd.date_range(start=start, periods=months, freq="M"))
+        return list(pd.date_range(start=start, periods=months, freq="ME"))
     out: List[pd.Timestamp] = []
     y, m = start_y, start_m
     while (y < end_y) or (y == end_y and m <= end_m):

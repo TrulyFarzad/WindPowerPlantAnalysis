@@ -16,16 +16,22 @@ Assumptions (MVP):
   * No debt service/tax yet (kept for later iterations)
 """
 
+# --- imports (top of cashflow.py) ---
 from __future__ import annotations
 import os
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# --- local modules ---
-from wind_resource import sample_production_paths_monthly, _jalali_month_range
-from price_model import sample_price_path_monthly, _build_price_config  # <-- IMPORTANT
+# Robust intra-package imports: try package-relative first, fallback to local
+try:
+    from .price_model import _build_price_config, sample_price_path_monthly
+    from .wind_resource import sample_production_paths_monthly, _jalali_month_range
+except ImportError:
+    from price_model import _build_price_config, sample_price_path_monthly
+    from wind_resource import sample_production_paths_monthly, _jalali_month_range
+
 
 # ----------------------------- utils -----------------------------
 
@@ -92,7 +98,7 @@ def build_monthly_vectors(cfg: Dict, horizon_months: int) -> Tuple[np.ndarray, n
     rng = np.random.default_rng(seed)
 
     # --- PRICE paths (build proper dataclass config) ---
-    price_cfg = _build_price_config(cfg)  # <-- pass the whole YAML, not just cfg["price"]
+    price_cfg = _build_price_config(cfg["price"])  # <-- pass the whole YAML, not just cfg["price"]
     price_paths, _, _ = sample_price_path_monthly(
         n_iter=n_iter, months_h=horizon_months, rng=rng, cfg=price_cfg
     )
