@@ -1,0 +1,14 @@
+{
+  "version": 4,
+  "power_scale": 4.056117579943496,
+  "v_shift": 1.4000000000000004,
+  "ti_mean": 0.009927194549868939,
+  "availability_obs": 0.7738175341381358,
+  "unit_infos": [
+    {
+      "ws_unit": "km/h -> m/s",
+      "p_unit": "MW -> kW"
+    }
+  ],
+  "notes": "SCADA-derived with column overrides, counts handling, and operational availability."
+}
