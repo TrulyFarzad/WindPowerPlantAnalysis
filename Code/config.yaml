@@ -18,7 +18,7 @@ wind:
   # Power curve source
   power_curve_source: "auto"        # auto → try windpowerlib then IEC-like
   turbine_name: "V112/3000"
-  rated_kw: 3075                 # only if you want to force IEC-like rating
+  # rated_kw: 3075                 # only if you want to force IEC-like rating
 
   # Intra-month dynamics
   diurnal_enable: true

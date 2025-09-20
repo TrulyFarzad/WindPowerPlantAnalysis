@@ -133,30 +133,60 @@ def _try_windpowerlib_curve(
     hub_height_m: Optional[float] = None,
     turbine_library_csv: Optional[str] = None,
 ) -> Optional[_Curve]:
-    """
-    Robust lookup for a windpowerlib turbine power curve.
-
-    - Accepts either a pure turbine_type (e.g., "V112/3000") or a combined string
-      like "Vestas V112/3000" (case-insensitive).
-    - Passes hub_height to WindTurbine ctor (required by many libs).
-    - Supports power column named 'power' OR 'value' (depending on library/version).
-    """
     if not turbine_name:
         return None
     try:
         from windpowerlib import wind_turbine, get_turbine_types
-
         turb_lib = None
         if turbine_library_csv and os.path.exists(turbine_library_csv):
             turb_lib = pd.read_csv(turbine_library_csv)
 
+        # --- 1) direct attempt with the provided name (exact turbine_type)
+        try:
+            wt = wind_turbine.WindTurbine(
+                turbine_type=str(turbine_name),
+                hub_height=float(hub_height_m) if hub_height_m is not None else 100.0,
+                turbine_library=turb_lib,
+            )
+            pc = getattr(wt, "power_curve", None)
+            if pc is not None and "wind_speed" in pc.columns:
+                v = pd.to_numeric(pc["wind_speed"], errors="coerce").to_numpy(dtype=float)
+                # power|value like your test
+                if "power" in pc.columns:
+                    p_series = pd.to_numeric(pc["power"], errors="coerce")
+                elif "value" in pc.columns:
+                    p_series = pd.to_numeric(pc["value"], errors="coerce")
+                else:
+                    num_cols = [c for c in pc.columns if c != "wind_speed" and pd.api.types.is_numeric_dtype(pc[c])]
+                    if not num_cols:
+                        p_series = None
+                    else:
+                        p_series = pd.to_numeric(pc[num_cols[0]], errors="coerce")
+                if p_series is not None:
+                    P = p_series.to_numpy(dtype=float) / 1000.0  # W→kW
+                    good = np.isfinite(v) & np.isfinite(P)
+                    v, P = v[good], P[good]
+                    if v.size:
+                        order = np.argsort(v)
+                        v, P = v[order], P[order]
+                        rated_kw = float(np.nanmax(P)) if np.isfinite(P).any() else 0.0
+                        if rated_kw > 0:
+                            v_pos = v[P > 0]
+                            v_cut_in = float(v_pos.min()) if v_pos.size else 3.0
+                            v_cut_out = float(v.max())
+                            return _Curve(v=v, p_kw=P, rated_kw=rated_kw,
+                                          v_cut_in=v_cut_in, v_cut_out=v_cut_out)
+        except Exception:
+            pass  # fall through to search
+
+        # --- 2) fallback: search list and pick exact/contains match
         try:
             avail = get_turbine_types(turbine_library=turb_lib)
         except Exception:
             avail = wind_turbine.get_turbine_types(turbine_library=turb_lib)
 
         pairs: List[Tuple[str, str]] = []
-        if isinstance(avail, pd.DataFrame) and {"manufacturer", "turbine_type"}.issubset(avail.columns):
+        if isinstance(avail, pd.DataFrame) and {"manufacturer","turbine_type"}.issubset(avail.columns):
             for _, row in avail.iterrows():
                 pairs.append((str(row["manufacturer"]), str(row["turbine_type"])))
         else:
@@ -166,21 +196,17 @@ def _try_windpowerlib_curve(
                     if isinstance(it, tuple) and len(it) >= 2:
                         pairs.append((str(it[0]), str(it[1])))
 
-        if not pairs:
-            return None
-
         q = str(turbine_name).strip().lower()
-        chosen_type: Optional[str] = None
+        chosen_type = None
+        # prefer exact turbine_type first
         for man, typ in pairs:
             if q == typ.lower():
-                chosen_type = typ
-                break
+                chosen_type = typ; break
         if chosen_type is None:
+            # then manufacturer+type contains
             for man, typ in pairs:
-                combo = (man + " " + typ).lower()
-                if q == combo or q in combo:
-                    chosen_type = typ
-                    break
+                if q in (man + " " + typ).lower():
+                    chosen_type = typ; break
         if chosen_type is None:
             return None
 
@@ -192,38 +218,29 @@ def _try_windpowerlib_curve(
         pc = getattr(wt, "power_curve", None)
         if pc is None or "wind_speed" not in pc.columns:
             return None
-
-        v = pd.to_numeric(pc["wind_speed"], errors="coerce")
+        v = pd.to_numeric(pc["wind_speed"], errors="coerce").to_numpy(dtype=float)
         if "power" in pc.columns:
             p_series = pd.to_numeric(pc["power"], errors="coerce")
         elif "value" in pc.columns:
             p_series = pd.to_numeric(pc["value"], errors="coerce")
         else:
             num_cols = [c for c in pc.columns if c != "wind_speed" and pd.api.types.is_numeric_dtype(pc[c])]
-            if not num_cols:
-                return None
+            if not num_cols: return None
             p_series = pd.to_numeric(pc[num_cols[0]], errors="coerce")
-
-        v = v.to_numpy(dtype=float)
-        P = p_series.to_numpy(dtype=float) / 1000.0  # kW
+        P = p_series.to_numpy(dtype=float) / 1000.0
         good = np.isfinite(v) & np.isfinite(P)
         v, P = v[good], P[good]
-        if v.size == 0:
-            return None
-        order = np.argsort(v)
-        v, P = v[order], P[order]
-
+        if not v.size: return None
+        order = np.argsort(v); v, P = v[order], P[order]
         rated_kw = float(np.nanmax(P)) if np.isfinite(P).any() else 0.0
-        if rated_kw <= 0:
-            return None
-
+        if rated_kw <= 0: return None
         v_pos = v[P > 0]
         v_cut_in = float(v_pos.min()) if v_pos.size else 3.0
-        v_cut_out = float(v.max()) if rated_kw > 0 else 25.0
-
+        v_cut_out = float(v.max())
         return _Curve(v=v, p_kw=P, rated_kw=rated_kw, v_cut_in=v_cut_in, v_cut_out=v_cut_out)
     except Exception:
         return None
+
 
 
 def _p_of_v(v: np.ndarray, curve: _Curve) -> np.ndarray:
@@ -429,7 +446,7 @@ def sample_production_paths_monthly(
     """
     Returns:
       energy_paths_mwh: (N, T) monthly energy
-      cf_quantiles:     (3, T)  P10, P50, P90 of monthly CF
+      cf_quantiles:     (3, T)  P10, P50, P90 of monthly CF (gross)
       meta:             dict
       charts:           dict (unused here)
     """
@@ -469,15 +486,22 @@ def sample_production_paths_monthly(
     curve = None
     src = str(wind.get("power_curve_source", "auto")).lower()
     turbine_library_csv = wind.get("turbine_library_csv")
-    if src in ("auto", "windpowerlib"):
+    force_iec = bool(wind.get("force_iec_like", False))
+
+    if not force_iec and src in ("auto", "windpowerlib"):
         curve = _try_windpowerlib_curve(
             wind.get("turbine_name"),
             hub_height_m=z_hub,
             turbine_library_csv=turbine_library_csv,
         )
+        if curve is not None:
+            src = "windpowerlib"
+
     if curve is None:
         rated_kw_hint = float(wind.get("rated_kw")) if wind.get("rated_kw") else cap_mw * 1000.0
         curve = _iec_like_curve(rated_kw_hint)
+        src = "iec_like"
+
 
     # --- Mode B: apply SCADA calibration if requested
     calib_meta: Dict[str, Any] = {}
@@ -511,7 +535,7 @@ def sample_production_paths_monthly(
                 timestamp_col=fcfg.get("timestamp_col"),
                 value_pref=fcfg.get("value_pref"),
                 by_month=bool(fcfg.get("by_month", True)),
-                freq=str(fcfg.get("freq", "H")),
+                freq=str(fcfg.get("freq", "H")).lower(),  # ← FutureWarning fix
                 min_days_per_month=int(fcfg.get("min_days_per_month", 5)),
                 smooth_hours=int(fcfg.get("smooth_hours", 3)),
             )
@@ -532,9 +556,11 @@ def sample_production_paths_monthly(
         H = _hours_in_month(yy, mm)
         hours = spm if spm > 0 else H
 
+        # Weibull random hourly speeds
         U = rng.uniform(0.0, 1.0, size=(N, hours))
         v = c_hub * (-np.log1p(-U)) ** (1.0 / k_m)
 
+        # Diurnal modulation
         if diurnal_profile is not None:
             for i in range(N):
                 v[i] = _apply_diurnal_to_speed(v[i], (mm - 1) % 12, diurnal_profile)
@@ -544,20 +570,25 @@ def sample_production_paths_monthly(
             v = v * f
             v = np.where(vm > 0, v * (vm / (v.mean(axis=1, keepdims=True) + 1e-9)), v)
 
+        # AR(1) on log-speed
         if ar1_phi > 0.0:
             for i in range(N):
                 v[i] = _ar1_on_log(v[i], ar1_phi, rng)
 
+        # TI noise
         if ti > 0.0:
             v = _apply_ti_noise(v, ti, rng)
 
+        # Cut-in/out hysteresis → on/off mask
         on_mask = np.stack([_cutout_hysteresis(v[i], curve.v_cut_in, curve.v_cut_out) for i in range(N)], axis=0)
         v_eff = np.where(on_mask, v, 0.0)
 
+        # Power mapping and monthly CF (gross)
         p_kw = _p_of_v(v_eff, curve)
         cf_month = np.clip((p_kw.mean(axis=1)) / max(1e-9, curve.rated_kw), 0.0, 1.0)
         cf_all[:, t] = cf_month
 
+        # Monthly energy (net): availability, losses, degradation
         e_mwh = cf_month * cap_mw * H
         e_mwh *= avail * (1.0 - losses) * (degr_m ** t)
 
@@ -587,6 +618,7 @@ def sample_production_paths_monthly(
     charts: Dict[str, Any] = {}
 
     return energy_paths, cf_q, meta, charts
+
 
 # ------------------------- main ---------------------------
 
