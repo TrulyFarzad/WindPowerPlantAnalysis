@@ -509,9 +509,14 @@ def sample_production_paths_monthly(
         calib_path = scada_cfg.get("calibration_profile_path")
         if calib_path and os.path.exists(calib_path):
             prof = _load_calibration_profile(calib_path)
-            power_scale = float(prof.get("power_scale", 1.0))
+            ps_orig = float(prof.get("power_scale", 1.0))
+            power_scale = min(1.3, ps_orig)     # soft cap برای جلوگیری از اشباع غیرواقعی
             v_shift = float(prof.get("v_shift", 0.0))
             curve = _apply_calibration_to_curve(curve, power_scale=power_scale, v_shift=v_shift)
+            if ps_orig != power_scale:
+                prof = dict(prof)
+                prof["power_scale_capped_at"] = 1.3
+                prof["power_scale_before_cap"] = ps_orig
             if ti is None and ("ti_mean" in prof):
                 ti = float(prof["ti_mean"])
             if avail is None and ("availability_obs" in prof):
