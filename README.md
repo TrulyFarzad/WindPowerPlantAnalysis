@@ -1,6 +1,7 @@
 # Wind Plant Economic Analysis under Uncertainty
 
-![Wind Energy](flowchart.jpg)
+![flowchart](https://github.com/user-attachments/assets/f23a97b6-4ae4-4e46-b604-4ec439741cb4)
+
 
 ## 📌 Overview
 This project provides a **comprehensive probabilistic framework** for the **economic analysis of wind power plants**.  
@@ -39,6 +40,8 @@ Code.zip/                       # Source code (Python)
 │   ├── price_paths.csv         # Electricity price samples
 │   ├── npv_distribution.png    # Example output chart
 │
+├── LICENSE
+|
 └── README.md                   # (this file)
 ```
 
@@ -87,8 +90,8 @@ Code.zip/                       # Source code (Python)
 ## ⚙️ Installation & Usage
 ### 1. Clone Repository
 ```bash
-git clone https://github.com/<your-username>/wind-plant-economic-analysis.git
-cd wind-plant-economic-analysis
+git clone https://github.com/<your-username>/WindPowerPlantAnalysis.git
+cd WindPowerPlantAnalysis
 ```
 
 ### 2. Create Virtual Environment
