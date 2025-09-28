@@ -1,143 +1,148 @@
-# Wind Power Plant Economic & Risk Analysis
+# Wind Plant Economic Analysis under Uncertainty
 
-📌 **هدف پروژه**  
-این ریپازیتوری یک چارچوب محاسباتی برای **امکان‌سنجی و تحلیل ریسک نیروگاه بادی** (مقیاس ~۱۰ MW) فراهم می‌کند.  
-به‌جای مقادیر قطعی، خروجی‌ها به‌صورت **توزیعی و احتمالاتی** ارائه می‌شوند (P50/P90، توزیع NPV/IRR/LCOE، سنجه‌های VaR/CVaR، Omega-LCOE).  
+![Wind Energy](flowchart.jpg)
 
----
+## 📌 Overview
+This project provides a **comprehensive probabilistic framework** for the **economic analysis of wind power plants**.  
+Unlike traditional deterministic models, we use **Monte Carlo Simulation (MCS)** with correlated uncertainties to evaluate **production, revenues, and financial indicators (NPV, IRR, LCOE, VaR/CVaR, Omega-LCOE)**.
 
-## ✨ Features
+The architecture integrates:
+- **Wind Resource Modeling**: Monthly Weibull parameters, vertical extrapolation, air density adjustment.
+- **Power Curve Modeling**: Manufacturer curves + **SCADA calibration** to align with real-world turbine behavior.
+- **Electricity Price Modeling**: Historical datasets + block-bootstrap resampling to capture seasonal/market risks.
+- **Economic Model**: CAPEX, OPEX, contracts (PPA/market/export), financing, taxes, and inflation scenarios.
+- **Risk Metrics**: Probabilistic KPIs with emphasis on **risk-adjusted returns**.
 
-- **مدل‌سازی تولید انرژی بادی** با توزیع‌های ویبول ماهانه (Weibull) و منحنی توان توربین (WTPC).  
-- **کالیبراسیون SCADA** برای نزدیک‌کردن مدل به رفتار واقعی سایت.  
-- **مدل‌سازی قیمت برق** در سناریوهای داخلی (خرید تضمینی / PPA) و صادراتی.  
-- **شبیه‌سازی مونت‌کارلو (MCS)** با ≈۱۰,۰۰۰ تکرار برای انتشار عدم‌قطعیت‌ها.  
-- **شاخص‌های اقتصادی:** NPV، IRR، Payback، LCOE.  
-- **شاخص‌های ریسک:** VaR، CVaR، Omega-LCOE.  
-- **تحلیل حساسیت (Sobol/ANN/SHAP)** برای شناسایی محرک‌های کلیدی.  
-- **پشتیبانی از سناریوهای قرارداد و سیاست‌گذاری** (FIT، PPA، صادرات، ریسک FX/تورم).  
-- **Pipeline ماژولار و بازتولیدپذیر** با تنظیمات شفاف در فایل `config.yaml`.
+This framework enables **robust investment decisions** under uncertainty in wind energy projects.
 
 ---
 
-## 🏗️ Project Architecture
-
+## 🏗️ Project Structure
 ```
-data/               # داده‌های خام و پردازش‌شده (Open-Meteo, SCADA, Weibull monthly, ...)
-scraping/           # اسکریپت‌های استخراج داده (Open-Meteo API, ...)
-modeling/           # ماژول‌های فنی (weibull_fit, turbine_power_curve, ...)
-src/
-  ├─ wind_resource.py   # مدل باد و تولید انرژی
-  ├─ price_model.py     # مدل‌سازی قیمت برق
-  ├─ cashflow.py        # محاسبه جریان نقدی و شاخص‌های اقتصادی
-  ├─ monte_carlo.py     # شبیه‌سازی مونت‌کارلو و ادغام عدم‌قطعیت‌ها
-  ├─ report.py          # تولید گزارش، نمودارها و خروجی HTML/Excel
-config.yaml          # فایل پیکربندی مرکزی (ورودی‌ها، پارامترها، سناریوها)
-requirements.txt     # وابستگی‌های پایتون
-reports/             # گزارش‌های خروجی (Markdown, HTML, PDF, PNG, CSV/Excel)
-notebooks/           # نوت‌بوک‌های توسعه و اعتبارسنجی
+Code.zip/                       # Source code (Python)
+│── main.py                     # Main entry point (runs full pipeline)
+│── production_model.py         # Wind production model (Modes A/B/C)
+│── price_model.py              # Electricity price simulation
+│── economics.py                # Cashflow + financial KPIs
+│── reporting.py                # Report generation (HTML/CSV/plots)
+│── config.yaml                 # Central configuration file
+│
+├── data/                       # Datasets
+│   ├── weibull_monthly.csv     # Monthly Weibull parameters (per city)
+│   ├── wind_turbine_scada/     # SCADA dataset for calibration
+│   ├── wind_power_forecasting/ # Time-series forecasting dataset
+│   ├── us_electricity_prices/  # U.S. electricity prices dataset
+│
+├── outputs/                    # Simulation results
+│   ├── mvp_report.html         # Main Monte Carlo simulation report
+│   ├── production_paths.csv    # Energy production samples
+│   ├── price_paths.csv         # Electricity price samples
+│   ├── npv_distribution.png    # Example output chart
+│
+└── README.md                   # (this file)
 ```
 
 ---
 
-## 📊 Data Sources
-
-- **Open-Meteo ERA5 API** → داده‌های ساعتی باد/دما/فشار در ارتفاع ۱۰۰ متر (برای ۱۰ شهر منتخب).  
-- **Weibull Monthly Dataset** → پارامترهای (k,c) ماهانه برای هر شهر.  
-- **SCADA Dataset** → برای کالیبراسیون منحنی توان.  
-- **Electricity Prices (U.S./Regional)** → برای ساخت سناریوهای قیمتی.  
+## 🔑 Key Features
+- **Three Production Modes (A/B/C):**
+  - **Mode A**: Weibull-only (statistical baseline)
+  - **Mode B**: SCADA-calibrated (realistic turbine behavior)
+  - **Mode C**: Hybrid (adds diurnal/short-term profiles)
+- **Monte Carlo Simulation** with thousands of scenarios (default N=2000–10000).
+- **Config-driven architecture** (`config.yaml`) ensures reproducibility and transparency.
+- **Modular design**: Replace/improve any module (production, price, economics) independently.
+- **Outputs for investors**: P50/P90 production, NPV distribution, IRR distribution, VaR/CVaR risk metrics.
 
 ---
 
-## ⚙️ Installation
+## 📊 Methodology
+1. **Wind Modeling**  
+   - Weibull parameters (k, c) estimated per month per city.  
+   - Adjusted for hub height and air density.  
+   - Integrated with turbine power curves.
 
+2. **Production Modeling**  
+   - Converts wind distributions to energy using turbine curves.  
+   - Optional SCADA calibration (power scale, v-shift, TI, availability).  
+   - Supports diurnal/seasonal profiles.
+
+3. **Price Modeling**  
+   - U.S. electricity price dataset (monthly).  
+   - Converted to USD/MWh.  
+   - Monte Carlo via **block-bootstrap (12-month blocks)** to preserve seasonality.  
+
+4. **Economic Modeling**  
+   - Cashflows from CAPEX, OPEX, revenues.  
+   - Discounted at configurable project WACC.  
+   - KPIs: NPV, IRR, LCOE, Payback, VaR/CVaR, Omega-LCOE.
+
+5. **Reporting**  
+   - Outputs consolidated in **mvp_report.html** (tables + charts).  
+   - Fan charts for revenue/cashflows.  
+   - Histograms for NPV and IRR.  
+
+---
+
+## ⚙️ Installation & Usage
+### 1. Clone Repository
 ```bash
-# Clone repository
-git clone https://github.com/<your-org>/<repo-name>.git
-cd <repo-name>
+git clone https://github.com/<your-username>/wind-plant-economic-analysis.git
+cd wind-plant-economic-analysis
+```
 
-# Create environment (Python 3.10+ recommended)
+### 2. Create Virtual Environment
+```bash
 python -m venv .venv
-source .venv/bin/activate   # (Linux/macOS)
-.venv\Scripts\activate      # (Windows)
+source .venv/bin/activate   # Linux/Mac
+.venv\Scripts\activate    # Windows
+```
 
-# Install dependencies
+### 3. Install Dependencies
+```bash
 pip install -r requirements.txt
 ```
 
----
-
-## 🚀 Usage
-
-1. **تنظیم ورودی‌ها در `config.yaml`**  
-   - مکان (شهر، مختصات)  
-   - ظرفیت نیروگاه (MW)  
-   - پارامترهای باد (k,c ماهانه)  
-   - منحنی توان توربین  
-   - CAPEX، OPEX، نرخ تنزیل  
-   - سناریوی قیمت (FIT / صادرات)  
-
-2. **اجرای تحلیل:**
-
+### 4. Run Base Simulation
 ```bash
-python src/monte_carlo.py
+python main.py --config config.yaml
 ```
 
-3. **خروجی‌ها:**
-   - `reports/summary.md` → خلاصه مدیریتی  
-   - `reports/plots/` → نمودارها (PNG)  
-   - `reports/cashflow.xlsx` → جریان نقدی و KPIها  
-   - `reports/output.html` → گزارش تعاملی  
+---
+
+## 📂 Datasets
+- **`weibull_monthly.csv`** → Monthly wind speed Weibull parameters (10 cities in Iran).  
+- **SCADA Dataset (Kaggle)** → 2018 10-min SCADA data for calibration.  
+- **Wind Power Forecasting Dataset (Kaggle)** → 2.5 years, 10-min time series for turbine behavior. 
+- **U.S. Electricity Prices (Kaggle)** → Monthly prices from 2001–2024.  
+
+All datasets are **publicly available** and referenced in the project documentation.
 
 ---
 
-## 📈 Outputs
-
-- Annual production, revenue, OPEX, cashflow charts  
-- Histogram & CDF of NPV / IRR  
-- Tornado sensitivity diagram  
-- Scenario heatmap (Price × Production)  
-- Executive summary (Markdown/HTML)  
-
----
-
-## 🧩 Methodology (High-level)
-
-1. **Wind → Power → Energy:**  
-   - نمونه‌گیری سرعت باد ماهانه از Weibull(k,c).  
-   - نگاشت به توان با WTPC.  
-   - اعمال تلفات و دسترس‌پذیری.  
-
-2. **Price Modeling:**  
-   - مسیرهای تصادفی قیمت (ARIMA/Regime Switching).  
-   - سناریوهای قراردادی (FIT، صادرات).  
-
-3. **Cashflow & Economics:**  
-   - درآمد = انرژی × قیمت.  
-   - کسر CAPEX + OPEX.  
-   - محاسبه NPV، IRR، Payback، LCOE.  
-
-4. **Risk Simulation (Monte Carlo):**  
-   - ۱۰٬۰۰۰ مسیر شبیه‌سازی.  
-   - گزارش توزیع P50/P90، VaR/CVaR.  
-
----
-
-## 📌 Notes
-
-- تمام واحدها در محور/ستون‌ها شفاف درج می‌شوند (MW, MWh, IRR%, USD/IRR).  
-- همه‌ی ورودی‌ها و پارامترها در `config.yaml` نگهداری می‌شوند → بازتولید و سناریوسازی آسان.  
-- ماژول‌ها کاملاً مستقل هستند و امکان توسعه آینده (Curtailment، باتری، قراردادهای پیچیده‌تر) وجود دارد.  
+## 📑 References
+- [Windpowerlib Documentation](https://windpowerlib.readthedocs.io/)  
+- [Kaggle – Wind Turbine SCADA Dataset](https://www.kaggle.com/datasets/berkerisen/wind-turbine-scada-dataset)  
+- [Kaggle – Wind Power Forecasting](https://www.kaggle.com/datasets/theforcecoder/wind-power-forecasting)  
+- [Kaggle – U.S. Electricity Prices](https://www.kaggle.com/datasets/nicholasjhana/US-electricity-prices)  
+- [IRENA Reports](https://www.irena.org/)  
 
 ---
 
 ## 👥 Authors
+- **فرزاد نورسته**  
+- **علی خسروی**  
 
-- **Research & Code:** [Your Name / Team]  
-- **Supervisor / Advisor:** [Name if academic]  
+Advisor: **دکتر حبیب رجبی مشهدی**  
+Department of Electrical Engineering (Power Systems), **Ferdowsi University of Mashhad (FUM)**
 
 ---
 
-## 📄 License
+## 📜 License
+This project is released under the **CC BY-NC 4.0 License** (Non-Commercial).
 
-MIT License – feel free to use, modify, and distribute with attribution.
+---
+
+## ⭐ Acknowledgements
+This repository is part of our **undergraduate thesis project**:  
+*"تحلیل ریسک و بررسی امکان‌سنجی پروژه‌های صنعتی با تأکید بر پروژه‌های تولید انرژی تجدیدپذیر"*.
