@@ -49,13 +49,28 @@
 
   {% if charts.cashflow_monthly %}
     <h3>Monthly Cashflow — P50 (میله‌ای) + بازه P5–P95</h3>
-    <p class="muted">محور y طوری تنظیم شده که ۰ وسط قرار بگیرد تا CAPEX اولیه بقیه را پنهان نکند.</p>
+    <p class="muted">محور y به‌صورت متقارن حول صفر تنظیم شده و CAPEX در صورت خروج از محدوده با برچسب نمایش داده می‌شود.</p>
     <img src="{{ charts.cashflow_monthly.data_uri }}" alt="Cashflow monthly P50 bars & P5–P95 band">
+  {% endif %}
+
+  {% if charts.aep_annual %}
+    <h3>AEP — Annual Energy Production</h3>
+    <img src="{{ charts.aep_annual.data_uri }}" alt="AEP annual P50 & P5–P95">
+  {% endif %}
+
+  {% if charts.cf_annual %}
+    <h3>Capacity Factor — Annual</h3>
+    <img src="{{ charts.cf_annual.data_uri }}" alt="CF annual P50 & P5–P95">
+  {% endif %}
+
+  {% if charts.lcoe_cumulative %}
+    <h3>LCOE — Cumulative to Year</h3>
+    <img src="{{ charts.lcoe_cumulative.data_uri }}" alt="LCOE cumulative band">
   {% endif %}
 </div>
 
 <div id="distributions" class="section">
-  <h2>توزیع‌ها (NPV/IRR)</h2>
+  <h2>توزیع‌ها (NPV/IRR/LCOE)</h2>
 
   {% if charts.npv_hist %}
     <h3>هیستوگرام NPV</h3>
@@ -65,6 +80,11 @@
   {% if charts.irr_hist %}
     <h3>هیستوگرام IRR</h3>
     <img src="{{ charts.irr_hist.data_uri }}" alt="IRR histogram">
+  {% endif %}
+
+  {% if charts.lcoe_hist %}
+    <h3>هیستوگرام LCOE (طول‌عمر)</h3>
+    <img src="{{ charts.lcoe_hist.data_uri }}" alt="LCOE histogram lifetime">
   {% endif %}
 
   {% if percentiles %}

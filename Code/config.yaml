@@ -38,7 +38,7 @@ report:
 costs:
   capex_usd_per_kw: 900
   opex_usd_per_kw_yr: 35
-  inflation_opex: 0.2
+  inflation_opex: 0.0
 monte_carlo:
   iterations: 2000
   random_seed: 4
@@ -61,7 +61,7 @@ site:
 economics:
   capex_usd_per_kw: 1000.0
   opex_usd_per_kw_yr: 40.0
-  inflation_opex: 0.2
+  inflation_opex: 0.0
 turbine:
   source: windpowerlib
   name: V112/3000
