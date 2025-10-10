@@ -45,7 +45,9 @@ def simulate_month(
 
 # در جایی که حلقه‌ی ماه‌ها اجرا می‌شود:
 # diurnal_profile می‌تواند None یا (12,24) یا (24,) باشد
-def run_mode_weibull_with_options(..., diurnal_profile: Optional[np.ndarray] = None, ...):
+def run_mode_weibull_with_options(*args, diurnal_profile: Optional[np.ndarray] = None, **kwargs):
+    """Placeholder wrapper; to be implemented or wired up to existing simulator."""
+    pass
     # ...
     for t in range(T):  # هر ماه
         mi = t % 12

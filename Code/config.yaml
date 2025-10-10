@@ -1,92 +1,68 @@
-# =========================
-# Wind Power Plant — Config
-# =========================
-
-
 wind:
-  # turbine_library_csv: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\wind turbine scada dataset\\T1.csv"  # (اختیاری) لایبرری سفارشی
-  mode: "scada_calibrated"
-
-  # Target location & Weibull source
-  city: "Khaf"
-  weibull_csv_path: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\weibull_monthly.csv"
-
-  # Hub height & shear
+  mode: scada_calibrated
+  city: Tabriz
+  weibull_csv_path: C:\HDD\Backup\uni\Project\WindPowerPlantAnalysis\Datasets\weibull_monthly.csv
   hub_height_m: 100
   alpha: 0.14
-
-  # Power curve source
-  power_curve_source: "auto"        # auto → try windpowerlib then IEC-like
-  turbine_name: "V112/3000"
-  # rated_kw: 3075                 # only if you want to force IEC-like rating
-
-  # Intra-month dynamics
+  power_curve_source: windpowerlib
+  turbine_name: E-101/3050
   diurnal_enable: true
   ar1_phi: 0.85
   samples_per_month: 720
-  power_curve_source: "windpowerlib"
-
-
-  # Turbulence intensity (leave unset to inject from SCADA profile if present)
-  # turbulence_intensity: 0.12
-
-
 scada:
-  # SCADA-calibration profile produced by build_calibration_profile.py
-  calibration_profile_path: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\calibration_profile.json"
-
+  calibration_profile_path: C:\HDD\Backup\uni\Project\WindPowerPlantAnalysis\Datasets\calibration_profile.json
 forecasting:
   enabled: true
-  file: "C:\\HDD\\Backup\\uni\\Project\\WindPowerPlantAnalysis\\Datasets\\wind power forecasting\\Turbine_Data.csv"  # دیتاست پیش‌بینی/عملکرد با timestamp
-  timestamp_col: "Unnamed: 0"          # اگر نام ستون زمان غیراستاندارد است
-  value_pref: ["WindSpeed","ActivePower"]
+  file: C:\HDD\Backup\uni\Project\WindPowerPlantAnalysis\Datasets\wind power forecasting\Turbine_Data.csv
+  timestamp_col: 'Unnamed: 0'
+  value_pref:
+  - WindSpeed
+  - ActivePower
   learn_diurnal_factor: true
-  by_month: true                      # پروفایل 12×24؛ اگر false → فقط 24ساعته
-  freq: "H"                           # به ساعتی نگاشت می‌کنیم
+  by_month: true
+  freq: H
   min_days_per_month: 5
   smooth_hours: 3
-
-
 plant:
-  capacity_mw: 20
-  # Leave availability unset to use availability_obs from SCADA profile
-  # availability: 0.97
-  losses_fraction: 0.10
-  degradation_per_year: 0.007
-
+  capacity_mw: 20.0
+  adjustment_factor: 0.95
 project:
   start_year: 2010
   start_month: 1
   years: 10
   discount_rate: 0.12
-
+  n_scenarios: 2000
+  n_workers: 1
 report:
-  title: "Wind MVP — Economic Report (USD)"
-
-plant:
-  capacity_mw: 20
-  availability: 0.97
-  losses_fraction: 0.10
-  degradation_per_year: 0.007
-
-
+  title: Wind MVP — Economic Report (USD)
 costs:
-  capex_usd_per_kw: 900      # دلاری
-  opex_usd_per_kw_yr: 35     # دلاری/کیلووات-سال
-  inflation_opex: 0.20       # رشد سالانهٔ OPEX
-
+  capex_usd_per_kw: 900
+  opex_usd_per_kw_yr: 35
+  inflation_opex: 0.2
 monte_carlo:
   iterations: 2000
   random_seed: 4
-
 price:
-  # دیتاست ماهانهٔ U.S. Electricity Prices (ستون‌های year, month, price, sales, stateDescription, sectorName)
-  us_csv: "C:\\HDD\\Backup\\uni\\Project\\Datasets\\Price\\U.S. Electricity Prices\\clean_data.csv"
-  unit_source: cent_per_kwh   # یا usd_per_kwh / usd_per_mwh
-  state: "*"                  # کل کشور
-  sector: "*"                 # همهٔ سکتورها
-  weight_col: sales           # میانگین وزنی بر اساس فروش/مصرف
+  us_csv: C:\HDD\Backup\uni\Project\Datasets\Price\U.S. Electricity Prices\clean_data.csv
+  unit_source: cent_per_kwh
+  state: '*'
+  sector: '*'
+  weight_col: sales
   tz: UTC
   block_len: 12
-
-
+optimization:
+  enable: false
+  min_mw: 5
+  max_mw: 50
+  step_mw: 5
+  objective: NPV_P50
+site:
+  city: Khaf
+economics:
+  capex_usd_per_kw: 1000.0
+  opex_usd_per_kw_yr: 40.0
+  inflation_opex: 0.2
+turbine:
+  source: windpowerlib
+  name: V112/3000
+  iec_class: IIA

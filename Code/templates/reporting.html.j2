@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>{{ title }}</title>
+<style>{{ style_css }}</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+
+<h1>{{ header }}</h1>
+<p class="muted"> {{ generated_at }} — Currency: {{ currency }} </p>
+
+{% if kpi_cards %}
+  <h2>شاخص‌های کلیدی</h2>
+  <div class="kpi">
+    {% for card in kpi_cards %}
+      <div class="card">
+        <div class="muted">{{ card.label }}</div>
+        <div style="font-weight:700;font-size:1.2em">{{ card.value }}</div>
+        {% if card.note %}<div class="muted">{{ card.note }}</div>{% endif %}
+      </div>
+    {% endfor %}
+  </div>
+{% endif %}
+
+<div id="charts" class="section">
+  <h2>نمودارها</h2>
+
+  {% if charts.production_annual %}
+    <h3>تولید سالانه — P50 و بازه P5–P95</h3>
+    <img src="{{ charts.production_annual.data_uri }}" alt="Production annual P50 & P5–P95">
+  {% endif %}
+
+  {% if charts.production_monthly %}
+    <h3>تولید ماهانه — P50 و بازه P5–P95</h3>
+    <img src="{{ charts.production_monthly.data_uri }}" alt="Production monthly P50 & P5–P95">
+  {% endif %}
+
+  {% if charts.price %}
+    <h3>قیمت / سناریوها — P50 و بازه P5–P95</h3>
+    <img src="{{ charts.price.data_uri }}" alt="Price scenarios P50 & P5–P95">
+  {% endif %}
+
+  {% if charts.revenue_monthly %}
+    <h3>Monthly Revenue — P50 و بازه P5–P95</h3>
+    <img src="{{ charts.revenue_monthly.data_uri }}" alt="Revenue monthly P50 & P5–P95">
+  {% endif %}
+
+  {% if charts.cashflow_monthly %}
+    <h3>Monthly Cashflow — P50 (میله‌ای) + بازه P5–P95</h3>
+    <p class="muted">محور y طوری تنظیم شده که ۰ وسط قرار بگیرد تا CAPEX اولیه بقیه را پنهان نکند.</p>
+    <img src="{{ charts.cashflow_monthly.data_uri }}" alt="Cashflow monthly P50 bars & P5–P95 band">
+  {% endif %}
+</div>
+
+<div id="distributions" class="section">
+  <h2>توزیع‌ها (NPV/IRR)</h2>
+
+  {% if charts.npv_hist %}
+    <h3>هیستوگرام NPV</h3>
+    <img src="{{ charts.npv_hist.data_uri }}" alt="NPV histogram">
+  {% endif %}
+
+  {% if charts.irr_hist %}
+    <h3>هیستوگرام IRR</h3>
+    <img src="{{ charts.irr_hist.data_uri }}" alt="IRR histogram">
+  {% endif %}
+
+  {% if percentiles %}
+    <h3>صدک‌ها</h3>
+    <table class="kpitable">
+      <thead><tr><th>شاخص</th><th>p5</th><th>p50</th><th>p95</th></tr></thead>
+      <tbody>
+        {% if percentiles.npv %}<tr><td>NPV</td><td>{{ percentiles.npv.p5 }}</td><td>{{ percentiles.npv.p50 }}</td><td>{{ percentiles.npv.p95 }}</td></tr>{% endif %}
+        {% if percentiles.irr %}<tr><td>IRR</td><td>{{ percentiles.irr.p5 }}</td><td>{{ percentiles.irr.p50 }}</td><td>{{ percentiles.irr.p95 }}</td></tr>{% endif %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+
+{% if kpis_full %}
+  <div id="tables" class="section">
+    <h2>KPIs (کامل)</h2>
+    <table class="kpitable">
+      <tbody>
+      {% for k, v in kpis_full.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
+{% if meta_pretty %}
+  <div id="meta" class="section">
+    <h2>Meta</h2>
+    <pre class="muted">{{ meta_pretty }}</pre>
+  </div>
+{% endif %}
+
+</body>
+</html>

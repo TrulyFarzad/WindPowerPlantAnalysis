@@ -1,150 +1,275 @@
-# main.py
-# Run end-to-end and emit an HTML report with embedded charts (USD)
-
+# Code/main.py — Jinja2-based reporting with P50 line/bars + P5–P95 band
 from __future__ import annotations
-import io, base64, json
 from pathlib import Path
+import json
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-import yaml
+import datetime
 
-import src.cashflow as cf  # local
-# price_model.py / production_model.py are imported by cashflow internally
+import src.cashflow as cf  # local economic engine
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from src.report_utils import save_fig_dual, timestamped_assets_dir
 
-def _load_cfg(cfg_path: Path) -> dict:
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+# ---------- styles (light/dark/auto) ----------
+def _style_block(theme: str = "auto") -> str:
+    base = """
+:root {--bg:#ffffff;--fg:#0f172a;--muted:#64748b;--card:#f8fafc;--border:#e2e8f0;--accent:#2563eb;}
+html,body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;margin:24px;line-height:1.5}
+h1,h2,h3{margin:.6em 0 .3em}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.kpi{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0}
+.card{border:1px solid var(--border);border-radius:12px;padding:12px 16px;min-width:220px;background:var(--card)}
+.muted{color:var(--muted);font-size:.9em}
+img{border:1px solid var(--border);border-radius:10px;margin:10px 0;max-width:100%;height:auto}
+table.kpitable{border-collapse:collapse;width:100%;margin:10px 0}
+table.kpitable td,table.kpitable th{border:1px solid var(--border);padding:8px;text-align:left}
+.section{margin-top:28px}
+small.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono','Courier New',monospace;color:var(--muted)}
+"""
+    dark = """
+:root {--bg:#0b0d10;--fg:#e8eaed;--muted:#a1a1aa;--card:#14181d;--border:#30363d;--accent:#60a5fa;}
+"""
+    if theme == "dark":
+        return dark + base
+    if theme == "light":
+        return base
+    return base + "@media (prefers-color-scheme: dark){" + dark + "}"
 
-def _horizon_months(cfg: dict) -> int:
-    proj = cfg.get("project", {}) or {}
-    years = int(proj.get("years", 10))
-    return years * 12
-
-def _png_dataurl(fig) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
-    buf.seek(0)
-    return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('ascii')}"
-
-def _fmt_usd(x: float) -> str:
+# ---------- helpers ----------
+def fmt_money(x):
     try:
-        return "$" + f"{x:,.0f}"
+        return "$" + f"{float(x):,.0f}"
     except Exception:
-        return f"${x}"
+        return str(x)
 
-def run(cfg_path: str = "config.yaml", out_html: str = "mvp_report.html") -> None:
-    # --- resolve paths relative to this file (main.py) ---
-    from pathlib import Path
-    base_dir = Path(__file__).resolve().parent
+def fmt_pct(x):
+    try:
+        return f"{float(x)*100:.2f}%"
+    except Exception:
+        return str(x)
 
-    cfg_file = Path(cfg_path)
-    if not cfg_file.is_absolute():
-        cfg_file = (base_dir / cfg_file).resolve()
+def compute_percentiles(npv_samples=None, irr_samples=None):
+    pct = {}
+    if npv_samples is not None and len(npv_samples) > 0:
+        p = np.percentile(npv_samples, [5, 50, 95])
+        pct["npv"] = {"p5": fmt_money(p[0]), "p50": fmt_money(p[1]), "p95": fmt_money(p[2])}
+    if irr_samples is not None and len(irr_samples) > 0:
+        p = np.percentile(irr_samples, [5, 50, 95])
+        pct["irr"] = {"p5": fmt_pct(p[0]), "p50": fmt_pct(p[1]), "p95": fmt_pct(p[2])}
+    return pct or None
 
-    out_file = Path(out_html)
-    if not out_file.is_absolute():
-        out_file = (base_dir / out_file).resolve()
+def _plot_band_line(x, p50, p5, p95, title, xlabel, ylabel):
+    fig, ax = plt.subplots(figsize=(9.5, 3.3))
+    ax.fill_between(x, p5, p95, alpha=0.15, lw=0, label="P5–P95")
+    ax.plot(x, p50, lw=2.2, label="P50")
+    ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.25); ax.legend()
+    fig.tight_layout()
+    return fig
 
-    # --- load config & horizon ---
-    cfg = _load_cfg(cfg_file)
-    T = _horizon_months(cfg)
+def _plot_cashflow_band_bars(
+    x, p50, p5, p95,
+    title, xlabel, ylabel,
+    scale_mode: str = "robust",   # "robust" | "fixed"
+    fixed_ylim_abs: float = None, # اگر fixed انتخاب شد، مثلا 1e6 بده
+    expand: float = 1.2           # ضریب بزرگ‌نمایی روی مقیاس روباست
+):
+    """
+    Bar chart for P50 with asymmetric error bars (P5–P95).
+    y-axis is centered at 0. For scaling:
+      - 'robust': compute symmetric limits from NON-CAPEX months (exclude month 0)
+      - 'fixed' : use fixed symmetrical limits ±fixed_ylim_abs
+    If CAPEX is outside the limits, annotate it with an arrow & value.
+    """
+    fig, ax = plt.subplots(figsize=(10.5, 3.6))
 
-    # ---------- Build vectors ----------
-    price_paths, energy_paths, opex_monthly, meta = cf.build_monthly_vectors(cfg, T, return_meta=True)
-    N, T = price_paths.shape
+    # میله‌های P50
+    ax.bar(x, p50, width=0.8, align="center", label="P50")
 
-    # future index (robust conversion)
-    future_idx_raw = meta.get("future_idx")
-    future_idx = pd.to_datetime(future_idx_raw) if future_idx_raw is not None else pd.date_range(
-        pd.Timestamp.utcnow().tz_localize("UTC").to_period("M").to_timestamp(how="start"),
-        periods=T, freq="MS", tz="UTC"
+    # خطاهای نامتقارن برای باند P5–P95
+    lower = np.maximum(0.0, p50 - p5)
+    upper = np.maximum(0.0, p95 - p50)
+    ax.errorbar(x, p50, yerr=[lower, upper], fmt="none", alpha=0.5, label="P5–P95")
+
+    # --- تعیین مقیاس ---
+    if scale_mode == "fixed" and fixed_ylim_abs:
+        M = float(fixed_ylim_abs)
+    else:
+        # مقیاس «روباست»: فقط از ماه‌های عملیاتی (غیر از CAPEX اول) استفاده کن
+        if len(p50) > 1:
+            arr = np.vstack([np.abs(p5[1:]), np.abs(p50[1:]), np.abs(p95[1:])])
+        else:
+            arr = np.vstack([np.abs(p5), np.abs(p50), np.abs(p95)])
+        # از صدک ۹۹ برای مقاومت در برابر نقاط پرت استفاده می‌کنیم
+        M = float(np.nanpercentile(arr, 99))
+        if not np.isfinite(M) or M == 0:
+            M = float(np.nanmax(arr) or 1.0)
+        M *= float(expand)
+
+    # محور y متقارن حول صفر
+    ax.set_ylim(-M, M)
+    ax.axhline(0.0, lw=1.0, alpha=0.5)
+
+    # اگر CAPEX (اولی) خارج از محدوده است، با فلش و لیبل نشانش بده
+    try:
+        capex_y = p50[0]
+        if capex_y < -M or capex_y > M:
+            y_edge = -M if capex_y < 0 else M
+            ax.annotate(
+                fmt_money(capex_y) + " (clipped)",
+                xy=(x[0], y_edge),
+                xytext=(x[0], y_edge * 0.85 if capex_y < 0 else y_edge * 0.85),
+                textcoords="data",
+                ha="center", va="top" if capex_y < 0 else "bottom",
+                arrowprops=dict(arrowstyle="->", lw=1.0, alpha=0.7),
+                fontsize=8, rotation=90,
+            )
+    except Exception:
+        pass
+
+    ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    ax.grid(True, axis="y", alpha=0.25); ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+# ---------- main entry ----------
+def run(cfg: dict, out_html: str = "mvp_report.html") -> None:
+    if not isinstance(cfg, dict):
+        raise TypeError("cfg must be a dict built by the Web UI")
+
+    project = cfg.get("project", {}) or {}
+    years = float(project.get("years", project.get("horizon_years", 20.0)))
+    horizon_months = int(round(years * 12))
+
+    price_paths, energy_paths, opex_monthly, meta = cf.build_monthly_vectors(
+        cfg, horizon_months, return_meta=True
     )
-
-    # ---------- Cashflows ----------
     cash_paths, revenue_paths = cf.build_cashflows(cfg, price_paths, energy_paths, opex_monthly)
-    summary = cf.evaluate_paths(cfg, cash_paths)
+    kpis = cf.evaluate_paths(cfg, cash_paths)
 
-    # ---------- Plots ----------
-    qs = [5, 50, 95]
-    rev_q = np.percentile(revenue_paths, qs, axis=0)
-    cash_q = np.percentile(cash_paths, qs, axis=0)
+    # percentiles along simulation axis (axis=0 if shape is (n_sims, n_months))
+    def pct_band(arr):
+        p = np.percentile(arr, [5, 50, 95], axis=0)
+        return p[0], p[1], p[2]  # p5, p50, p95
 
-    # Revenue fan
-    fig1 = plt.figure(figsize=(10, 3.6))
-    plt.plot(future_idx, rev_q[1], label="Revenue P50")
-    plt.fill_between(future_idx, rev_q[0], rev_q[2], alpha=0.2, label="Revenue P5–P95")
-    plt.title("Monthly Revenue — P50 & P5–P95")
-    plt.xlabel("Month"); plt.ylabel("USD"); plt.legend(); plt.tight_layout()
-    img_rev = _png_dataurl(fig1); plt.close(fig1)
+    months = np.arange(1, horizon_months + 1)
 
-    # Cashflow fan
-    fig2 = plt.figure(figsize=(10, 3.6))
-    plt.plot(future_idx, cash_q[1], label="Cash P50")
-    plt.fill_between(future_idx, cash_q[0], cash_q[2], alpha=0.2, label="Cash P5–P95")
-    plt.title("Monthly Cash Flow — P50 & P5–P95")
-    plt.xlabel("Month"); plt.ylabel("USD"); plt.legend(); plt.tight_layout()
-    img_cash = _png_dataurl(fig2); plt.close(fig2)
+    # Production — Monthly (line band)
+    p5_m, p50_m, p95_m = pct_band(energy_paths)
+    fig_prod_m = _plot_band_line(months, p50_m, p5_m, p95_m, "Production — Monthly P50 & P5–P95", "Month", "MWh")
 
-    # NPV hist (USD)
-    ann_disc = float(cfg.get("project", {}).get("discount_rate", 0.12))
-    r_m = cf._monthly_rate(ann_disc)
-    npvs = np.array([cf._npv_monthly(cash_paths[i], r_m) for i in range(N)])
-    fig3 = plt.figure(figsize=(8, 3.2))
-    plt.hist(npvs, bins=60); plt.title("NPV Distribution (USD)")
-    plt.xlabel("USD"); plt.ylabel("Count"); plt.tight_layout()
-    img_npv = _png_dataurl(fig3); plt.close(fig3)
+    # Production — Annual (sum each 12 months per sim)
+    n_sims = energy_paths.shape[0]
+    years_count = horizon_months // 12
+    energy_paths_trim = energy_paths[:, :years_count*12]
+    energy_annual = energy_paths_trim.reshape(n_sims, years_count, 12).sum(axis=2)
+    years_index = np.arange(1, years_count + 1)
+    p5_y, p50_y, p95_y = pct_band(energy_annual)
+    fig_prod_y = _plot_band_line(years_index, p50_y, p5_y, p95_y, "Production — Annual P50 & P5–P95", "Year", "MWh")
 
-    # IRR hist (annual)
-    irr_m = np.array([cf._irr_monthly(cash_paths[i], guess=0.01) for i in range(N)])
-    irr_a = (1.0 + irr_m)**12 - 1.0
-    irr_a = irr_a[~np.isnan(irr_a)]
-    img_irr = ""
-    if irr_a.size:
-        fig4 = plt.figure(figsize=(8, 3.2))
-        plt.hist(irr_a, bins=60); plt.title("IRR Distribution (Annual)")
-        plt.xlabel("IRR"); plt.ylabel("Count"); plt.tight_layout()
-        img_irr = _png_dataurl(fig4); plt.close(fig4)
+    # Price — Monthly (line band)
+    p5_p, p50_p, p95_p = pct_band(price_paths)
+    fig_price = _plot_band_line(months, p50_p, p5_p, p95_p, "Price — P50 & P5–P95", "Month", "USD/MWh")
 
-    # ---------- HTML ----------
-    cap_mw = float(cfg.get("plant", {}).get("capacity_mw", 20.0))
-    disc = float(cfg.get("project", {}).get("discount_rate", 0.12))
-    title = cfg.get("report", {}).get("title", "Wind MVP — Economic Report (USD)")
+    # Revenue — Monthly (line band, طبق خواسته بعد از دو نمودار بالا)
+    p5_r, p50_r, p95_r = pct_band(revenue_paths)
+    fig_rev = _plot_band_line(months, p50_r, p5_r, p95_r, "Monthly Revenue — P50 & P5–P95", "Month", "USD")
 
-    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<title>{title}</title>
-<style>
-body{{font-family:sans-serif;margin:24px}}h1,h2{{margin:.6em 0 .3em}}
-.kpi{{display:flex;gap:24px;flex-wrap:wrap}}
-.card{{border:1px solid #ddd;border-radius:10px;padding:12px 16px;min-width:220px}}
-.muted{{color:#666;font-size:.9em}} img{{border:1px solid #eee;border-radius:8px;margin:10px 0}}
-</style></head><body>
-<h1>{title}</h1>
-<p class="muted">Capacity: {cap_mw:.1f} MW — Discount rate: {disc:.2%} — Scenarios: {N:,} — Horizon: {T} months</p>
+    # Cashflow — Monthly (BAR + band via errorbar, y=0 centered)
+    p5_c, p50_c, p95_c = pct_band(cash_paths)
+    fig_cashbar = _plot_cashflow_band_bars(months, p50_c, p5_c, p95_c,
+                                           "Monthly Cashflow — P50 (bars) & P5–P95",
+                                           "Month", "USD")
 
-<h2>Key KPIs</h2>
-<div class="kpi">
-  <div class="card"><b>NPV P50:</b><br>{_fmt_usd(summary['NPV_P50'])}</div>
-  <div class="card"><b>NPV P10 / P90:</b><br>{_fmt_usd(summary['NPV_P5'])} / {_fmt_usd(summary['NPV_P95'])}</div>
-  <div class="card"><b>IRR P50:</b><br>{summary['IRR_P50']*100:.2f}% (annual)</div>
-  <div class="card"><b>Prob(NPV>0):</b><br>{summary['Prob_NPV_Positive']*100:.1f}%</div>
-</div>
+    # Save charts (PNG + Data URI)
+    assets_dir = timestamped_assets_dir(base_dir="report_assets")
+    charts_ctx = {}
+    du, pth = save_fig_dual(fig_prod_y, assets_dir, "production_annual"); plt.close(fig_prod_y)
+    charts_ctx["production_annual"] = {"data_uri": du, "png_path": pth}
+    du, pth = save_fig_dual(fig_prod_m, assets_dir, "production_monthly"); plt.close(fig_prod_m)
+    charts_ctx["production_monthly"] = {"data_uri": du, "png_path": pth}
+    du, pth = save_fig_dual(fig_price, assets_dir, "price"); plt.close(fig_price)
+    charts_ctx["price"] = {"data_uri": du, "png_path": pth}
+    du, pth = save_fig_dual(fig_rev, assets_dir, "revenue_monthly"); plt.close(fig_rev)
+    charts_ctx["revenue_monthly"] = {"data_uri": du, "png_path": pth}
+    du, pth = save_fig_dual(fig_cashbar, assets_dir, "cashflow_monthly"); plt.close(fig_cashbar)
+    charts_ctx["cashflow_monthly"] = {"data_uri": du, "png_path": pth}
 
-<h2>Charts</h2>
-<h3>Revenue</h3>
-<img src="{img_rev}" width="100%">
-<h3>Cash Flow</h3>
-<img src="{img_cash}" width="100%">
-<h3>NPV Histogram</h3>
-<img src="{img_npv}" width="85%">
-{"<h3>IRR Histogram</h3><img src='"+img_irr+"' width='85%'>" if img_irr else ""}
+    # NPV/IRR distributions (histograms)
+    from src.cashflow import _npv_monthly, _monthly_rate
+    npvs = [_npv_monthly(c, _monthly_rate(float(project.get("discount_rate", 0.12)))) for c in cash_paths]
+    fig_npv = plt.figure(figsize=(7.5, 3.3))
+    plt.hist(npvs, bins=40); plt.title("NPV Distribution (USD)"); plt.grid(True, alpha=0.3)
+    du, pth = save_fig_dual(fig_npv, assets_dir, "npv_hist"); plt.close(fig_npv)
+    charts_ctx["npv_hist"] = {"data_uri": du, "png_path": pth}
 
-<hr><p class="muted">Meta (price & production):</p>
-<pre class="muted">{json.dumps({k:v for k,v in meta.items() if k!='future_idx'}, indent=2)}</pre>
-</body></html>"""
+    irr_samples = None
+    try:
+        from src.cashflow import _irr_monthly
+        irr_m = [_irr_monthly(c, guess=0.01) for c in cash_paths]
+        irr_a = (1.0 + np.array(irr_m, float)) ** 12.0 - 1.0
+        irr_samples = irr_a[np.isfinite(irr_a)]
+        fig_irr = plt.figure(figsize=(7.5, 3.3))
+        plt.hist(irr_samples, bins=40); plt.title("IRR Distribution (Annualized)"); plt.grid(True, alpha=0.3)
+        du, pth = save_fig_dual(fig_irr, assets_dir, "irr_hist"); plt.close(fig_irr)
+        charts_ctx["irr_hist"] = {"data_uri": du, "png_path": pth}
+    except Exception:
+        pass
 
-    out_file.write_text(html, encoding="utf-8")
-    print(f"[ok] Report -> {out_file}")
+    # Percentiles table for npv/irr
+    percentiles = compute_percentiles(npv_samples=npvs, irr_samples=irr_samples)
+
+    # KPI cards
+    kpi_cards = []
+    for key in ["NPV_P50", "NPV_P5", "NPV_P95", "IRR_P50", "Prob_NPV_Positive"]:
+        if key in kpis:
+            if key.startswith("NPV"):
+                val = fmt_money(kpis[key])
+            elif key.startswith("IRR") or "Prob" in key:
+                val = fmt_pct(kpis[key])
+            else:
+                val = kpis[key]
+            kpi_cards.append({"label": key.replace("_"," "), "value": val, "note": None})
+
+    # Meta
+    safe_meta = {k: v for k, v in (meta or {}).items() if k != "future_idx"}
+    meta_pretty = json.dumps(safe_meta, ensure_ascii=False, indent=2)
+
+    # Render Jinja2
+    theme = (cfg.get("report") or {}).get("theme", "auto")
+    style_css = _style_block(theme)
+
+    env = Environment(
+        loader=FileSystemLoader(str(Path(__file__).parent / "templates")),
+        autoescape=select_autoescape(["html", "xml"]),
+    )
+    tpl = env.get_template("reporting.html.j2")
+
+    context = {
+        "title": "Wind MVP — Economic Report",
+        "header": "گزارش اقتصادی نیروگاه بادی",
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "currency": "USD",
+        "style_css": style_css,
+        "kpi_cards": kpi_cards,
+        "charts": charts_ctx,
+        "percentiles": percentiles,
+        "kpis_full": {
+            k: (fmt_money(v) if any(x in k for x in ["NPV","Revenue","Cash","CapEx"])
+               else (fmt_pct(v) if "IRR" in k else v))
+            for k, v in (kpis or {}).items()
+        },
+        "meta_pretty": meta_pretty,
+    }
+
+    out_path = (Path(__file__).parent / out_html) if not Path(out_html).is_absolute() else Path(out_html)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    html = tpl.render(**context)
+    out_path.write_text(html, encoding="utf-8")
+    print(f"[ok] Report -> {out_path}")
+    print(f"[ok] Assets -> {assets_dir}")
 
 if __name__ == "__main__":
-    run()
+    raise SystemExit("Launch via Web UI (backend_adapter → main.run(cfg)).")

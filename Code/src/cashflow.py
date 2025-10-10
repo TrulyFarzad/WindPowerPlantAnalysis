@@ -10,6 +10,7 @@ from typing import Dict, Tuple
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import json
 
 # Local modules (same folder)
 from . import price_model as pm
@@ -141,7 +142,9 @@ def build_cashflows(cfg: Dict, price_paths: np.ndarray, energy_paths: np.ndarray
     N, T = price_paths.shape
 
     # Revenue USD = MWh * USD/MWh
-    revenue_paths = energy_paths * price_paths  # (N,T)
+    adj = float(cfg.get('plant', {}).get('adjustment_factor', 1.0))
+    # Adjustment factor scales net delivered energy (curtailments, wake, BOP).
+    revenue_paths = (energy_paths * adj) * price_paths  # (N,T)
 
     # OPEX broadcast
     opex_b = np.broadcast_to(opex_monthly.reshape(1, T), (N, T))
@@ -168,3 +171,23 @@ def evaluate_paths(cfg: Dict, cash_paths: np.ndarray) -> Dict[str, float]:
         "Prob_NPV_Positive": float(np.mean(npvs > 0.0)),
         "Mean_NPV": float(np.nanmean(npvs)), "Mean_IRR_Annual": float(np.nanmean(irr_a)),
     }
+
+
+def optimize_capacity(cfg: Dict, horizon_months: int, caps_mw: np.ndarray, objective: str = "NPV_P50"):
+    """Grid-search capacity (MW) to maximize an objective over Monte Carlo.
+    Returns (best_cap_mw, table: pd.DataFrame with rows per capacity)."""
+    results=[]
+    cfg_base=dict(cfg)  # shallow copy is fine if we don't mutate nested except 'plant'
+    for cap in caps_mw:
+        cfg_eval=json.loads(json.dumps(cfg_base))  # deep copy via json
+        cfg_eval.setdefault('plant',{}); cfg_eval['plant']['capacity_mw']=float(cap)
+        price_paths, energy_paths, opex_monthly, meta = build_monthly_vectors(cfg_eval, horizon_months)
+        cash_paths, revenue_paths = build_cashflows(cfg_eval, price_paths, energy_paths, opex_monthly)
+        summary = evaluate_paths(cfg_eval, cash_paths)
+        summary.update({'capacity_mw': float(cap)})
+        results.append(summary)
+    df=pd.DataFrame(results).set_index('capacity_mw').sort_index()
+    if objective not in df.columns:
+        objective='NPV_P50'
+    best_cap=float(df[objective].idxmax())
+    return best_cap, df
