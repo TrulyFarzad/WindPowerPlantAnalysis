@@ -1,14 +1,16 @@
 # Code/main.py — Reporting with P50 line/bars + P5–P95 band, plus AEP/CF/LCOE & histograms
 from __future__ import annotations
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "Code"))
 import json
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
-
 import src.cashflow as cf  # local economic engine
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from src.report_utils import save_fig_dual, timestamped_assets_dir
+# from main import run
 
 # ---------- styles (light/dark/auto) ----------
 def _style_block(theme: str = "auto") -> str:
@@ -325,4 +327,5 @@ def run(cfg: dict, out_html: str = "mvp_report.html") -> None:
     print(f"[ok] Assets -> {assets_dir}")
 
 if __name__ == "__main__":
+    # run()
     raise SystemExit("Launch via Web UI (backend_adapter → main.run(cfg)).")
